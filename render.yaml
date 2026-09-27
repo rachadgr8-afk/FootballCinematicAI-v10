@@ -1,0 +1,64 @@
+# render.yaml — Render Blueprint for FOOTBALL CINEMATIC AI
+# Deploys the monolithic app (Express API + built SPA) via Docker so that
+# FFmpeg / FFprobe are guaranteed to be present in the runtime.
+#
+# Usage: Render Dashboard -> New -> Blueprint -> select this repo.
+# (A Dockerfile alone is enough too; this file just makes the setup declarative.)
+
+services:
+  - type: web
+    name: fotbal-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # FFmpeg rendering is CPU + memory heavy. The "starter" plan (1 GB) is a
+    # sane minimum; use "standard" (2 GB) for larger/simultaneous renders.
+    plan: standard
+    region: frankfurt
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Secret — set the value in the Render dashboard, never commit it.
+      # Comma-separated pool: the server rotates keys automatically so one
+      # exhausted key never blocks a render.
+      - key: GEMINI_API_KEYS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEYS
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        value: JBFqnCBsd6RMkjVDRZzb
+      - key: ELEVENLABS_MODEL_ID
+        value: eleven_multilingual_v2
+      - key: YOLO_ENABLED
+        value: "true"
+      - key: YOLO_MODEL_PATH
+        value: /app/models/best.pt
+      - key: PYTHON_BIN
+        value: /opt/yolo-venv/bin/python
+      # --- Storage / persistence ---
+      # Attach the disk below and point PUBLIC_DIR at its mount path so rendered
+      # videos survive deploys/restarts. Alternatively switch to S3/R2:
+      # set STORAGE_DRIVER=s3 + the S3_* variables (see DEPLOY_RENDER.md).
+      - key: STORAGE_DRIVER
+        value: local
+      - key: PUBLIC_DIR
+        value: /var/data/videos
+      # Auto-purge generated media older than 48h (keep the disk from filling up)
+      - key: MEDIA_RETENTION_HOURS
+        value: "48"
+    # ----------------------------------------------------------------------
+    # PERSISTENCE — Render's container filesystem is EPHEMERAL: anything
+    # written to the default public/videos is LOST on deploy/restart/scale.
+    # This disk keeps rendered outputs across restarts (single instance; a
+    # disk cannot be shared between multiple instances — use S3/R2 to scale).
+    # ----------------------------------------------------------------------
+    disk:
+      name: football-media
+      mountPath: /var/data
+      sizeGB: 5
+
+# RIFE post-processing
+# Set these in Render environment if overriding Docker defaults.

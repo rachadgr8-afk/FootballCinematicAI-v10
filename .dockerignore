@@ -1,0 +1,34 @@
+# Dependencies (reinstalled inside the image)
+node_modules
+
+# Build outputs (regenerated in the builder stage)
+dist
+server.js
+build
+
+# VCS / editor
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Env & secrets — never bake secrets into the image
+.env
+.env.*
+!.env.example
+
+# Logs / caches / OS junk
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+coverage
+
+# Local media dumps produced during dev (keep the seed clips though).
+# The uploaded_* test files are disposable; do not ship them.
+public/videos/uploaded_match_*
+
+# Docs not needed at runtime
+README.md
+DEPLOY_RENDER.md

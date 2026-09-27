@@ -1,0 +1,6 @@
+{
+  "name": "FOOTBALL CINEMATIC AI",
+  "description": "AI-powered football video editor transforming raw footage into 64-second vertical cinematic shorts using Gemini analysis, Veo generation, and precision rendering.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

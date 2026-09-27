@@ -1,0 +1,82 @@
+{
+  "success": true,
+  "version": "MADNESS-5",
+  "policy": "evidence_gated_real_footage_only",
+  "levels": {
+    "1": "cinematic",
+    "2": "exceptional",
+    "3": "crazy",
+    "4": "hallucination",
+    "5": "absolute_madness"
+  },
+  "counts": {
+    "1": 1,
+    "2": 0,
+    "3": 1,
+    "4": 0,
+    "5": 1
+  },
+  "timeline": [
+    {
+      "source_start": 0.8,
+      "source_end": 1.5,
+      "importance": 8,
+      "beat_role": "escalation",
+      "action": "dribble and feint",
+      "madness": {
+        "enabled": true,
+        "level": 3,
+        "name": "crazy",
+        "intensity": 0.707,
+        "evidence_score": 0.85,
+        "effect": "selective_color_freeze",
+        "evidence_events": [
+          "ball_engagement",
+          "direction_change_candidate",
+          "pressure_candidate"
+        ],
+        "reason": "evidence-gated cinematic escalation",
+        "safety": "real_footage_only"
+      }
+    },
+    {
+      "source_start": 2.8,
+      "source_end": 3.4,
+      "importance": 9,
+      "beat_role": "climax",
+      "action": "dribble past defender",
+      "madness": {
+        "enabled": true,
+        "level": 5,
+        "name": "absolute_madness",
+        "intensity": 0.8616,
+        "evidence_score": 0.92,
+        "effect": "absolute_madness",
+        "evidence_events": [
+          "ball_engagement",
+          "explosive_run"
+        ],
+        "reason": "evidence-gated cinematic escalation",
+        "safety": "real_footage_only"
+      }
+    },
+    {
+      "source_start": 5,
+      "source_end": 6,
+      "importance": 4,
+      "beat_role": "outro",
+      "action": "reaction",
+      "madness": {
+        "enabled": false,
+        "level": 1,
+        "name": "cinematic",
+        "intensity": 0.192,
+        "evidence_score": 0.0,
+        "effect": "cinematic_pulse",
+        "evidence_events": [],
+        "reason": "evidence-gated cinematic escalation",
+        "safety": "real_footage_only"
+      }
+    }
+  ]
+}

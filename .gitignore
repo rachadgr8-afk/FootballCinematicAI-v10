@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+build/
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Capacitor / Android
+android/app/build/
+android/build/
+android/.gradle/
+android/app/src/main/assets/public/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Misc
+*.tmp
+android/key.properties
+android/local.properties
+android/*.jks
+
+# Disposable test uploads & generated render outputs
+public/videos/uploaded_match_*
+public/videos/final_commentary_*.mp4

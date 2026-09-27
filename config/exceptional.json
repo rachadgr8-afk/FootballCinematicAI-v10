@@ -1,0 +1,63 @@
+{
+  "version": "2026-09-27-exceptional-v10",
+  "defaults": {
+    "highlight_count": 8,
+    "rife": "off",
+    "scene_aware_rife": true,
+    "reid_min_score": 0.72,
+    "reid_min_margin": 0.035,
+    "max_upload_mb": 500
+  },
+  "quality": {
+    "min_duration_seconds": 0.5,
+    "decode_samples": 3
+  },
+  "event_engine": {
+    "ball_proximity_weight": 0.3,
+    "motion_weight": 0.28,
+    "acceleration_weight": 0.17,
+    "confidence_weight": 0.25
+  },
+  "commentary_director": {
+    "enabled": true,
+    "max_lines": 14,
+    "natural_pauses": true,
+    "emotion_adaptive_voice": true,
+    "sidechain_ducking": true,
+    "stability": 0.34,
+    "style_exaggeration": 0.32,
+    "speed_range": [
+      0.88,
+      1.12
+    ]
+  },
+  "director": {
+    "football_semantic_editing": true,
+    "beat_sync": true,
+    "story_arc": [
+      "hook",
+      "setup",
+      "escalation",
+      "impact",
+      "reaction",
+      "climax",
+      "outro"
+    ],
+    "silence_as_editing": true
+  },
+  "football_director": {
+    "enabled": true,
+    "evidence_driven": true,
+    "peak_separation_seconds": 1.5,
+    "silence_before_high_tension_ms": 120,
+    "story_roles": [
+      "hook",
+      "setup",
+      "escalation",
+      "impact",
+      "reaction",
+      "climax",
+      "outro"
+    ]
+  }
+}

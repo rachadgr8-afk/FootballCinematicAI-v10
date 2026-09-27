@@ -1,0 +1,1 @@
+{"events": [{"time": 1.0, "event_score": 0.85, "events": ["ball_engagement", "direction_change_candidate", "pressure_candidate"]}, {"time": 3.0, "event_score": 0.92, "events": ["explosive_run", "ball_engagement"]}]}

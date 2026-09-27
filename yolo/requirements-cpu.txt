@@ -1,0 +1,4 @@
+# Official PyTorch CPU wheels
+# Keep these versions paired; do NOT replace with generic `pip install torch`.
+torch==2.6.0+cpu
+torchvision==0.21.0+cpu

@@ -1,0 +1,13 @@
+# CPU-safe Python dependencies for FootballCinematicAI ULTRA
+# The CPU PyTorch index is an extra index so normal PyPI packages remain available.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Official PyTorch CPU wheel pair
+torch==2.6.0+cpu
+torchvision==0.21.0+cpu
+
+ultralytics>=8.3.0
+opencv-python-headless>=4.10.0
+git+https://github.com/megvii-research/ECCV2022-RIFE.git
+
+pytest>=8.3,<9
