@@ -284,7 +284,10 @@ export default function App() {
       const versionData = await safeFetchJson<any>('/api/version', { method: 'GET' });
       const backendVersion = String(versionData?.buildVersion || '');
       if (!backendVersion.includes('exceptional-v10')) {
-        throw new Error(`Backend is incompatible (${backendVersion || 'unknown'}). Deploy the FootballCinematicAI v10 backend before rendering.`);
+        throw new Error(
+          `Backend is incompatible (${backendVersion || 'unknown'}). ` +
+            `Contacted backend: ${API_BASE_URL}. Deploy the FootballCinematicAI v10 backend before rendering.`
+        );
       }
 
       // 1. Gemini Analysis

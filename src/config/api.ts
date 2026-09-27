@@ -119,7 +119,14 @@ export async function safeFetchJson<T = any>(
 
     // Never output raw HTML stack traces or doctype tags
     const cleanSnippet = errorText.replace(/<[^>]*>?/gm, ' ').replace(/\s+/g, ' ').trim();
-    const friendlyMsg = getFriendlyErrorMessage(response.status, cleanSnippet, endpoint);
+    let friendlyMsg = getFriendlyErrorMessage(response.status, cleanSnippet, endpoint);
+
+    // On a 404, surface the ACTUAL host that was contacted. This turns a vague
+    // "route not found" into an actionable diagnostic when a stale build/device
+    // is still pointing at a decommissioned backend URL.
+    if (response.status === 404) {
+      friendlyMsg += ` (contacted: ${url})`;
+    }
 
     console.warn(`[API DEBUG] HTTP ${response.status} from ${url}:`, {
       contentType,

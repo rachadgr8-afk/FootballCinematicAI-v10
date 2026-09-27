@@ -1427,8 +1427,28 @@ async function startServer() {
   } else {
     const distPath = path.join(__dirname, 'dist');
     if (fs.existsSync(distPath)) {
-      app.use(express.static(distPath));
+      // Hashed assets (index-<hash>.js/css) are immutable: cache them hard so the
+      // browser never re-downloads the same build.
+      app.use(
+        express.static(distPath, {
+          // Let the catch-all below serve index.html (with no-store headers)
+          // for "/" instead of express.static's default cached copy.
+          index: false,
+          setHeaders: (res, filePath) => {
+            if (/\/assets\/.*-[A-Za-z0-9_-]{8,}\.(js|css)$/.test(filePath)) {
+              res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            }
+          },
+        })
+      );
+      // CRITICAL: the SPA entry (index.html) MUST NEVER be cached. Otherwise a
+      // device/WebView keeps loading the OLD hashed bundle (which pointed at a
+      // dead backend URL) even after a redeploy, producing phantom 404s such as
+      // "The server did not find the required API route (/api/version)".
       app.get('*', (req, res) => {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
         res.sendFile(path.join(distPath, 'index.html'));
       });
     }
