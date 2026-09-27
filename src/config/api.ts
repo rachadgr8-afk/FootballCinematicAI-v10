@@ -119,7 +119,23 @@ export async function safeFetchJson<T = any>(
 
     // Never output raw HTML stack traces or doctype tags
     const cleanSnippet = errorText.replace(/<[^>]*>?/gm, ' ').replace(/\s+/g, ' ').trim();
-    let friendlyMsg = getFriendlyErrorMessage(response.status, cleanSnippet, endpoint);
+
+    // If the backend actually returned structured JSON (success:false, error: "..."),
+    // that real message is far more useful than the generic status-code text below —
+    // surface it instead of silently discarding it.
+    let backendMessage = '';
+    if (isJson) {
+      try {
+        const parsedBody = JSON.parse(errorText);
+        if (parsedBody && typeof parsedBody.error === 'string' && parsedBody.error.trim()) {
+          backendMessage = parsedBody.error.trim();
+        }
+      } catch {
+        // errorText wasn't valid JSON despite the content-type header; fall through.
+      }
+    }
+
+    let friendlyMsg = backendMessage || getFriendlyErrorMessage(response.status, cleanSnippet, endpoint);
 
     // On a 404, surface the ACTUAL host that was contacted. This turns a vague
     // "route not found" into an actionable diagnostic when a stale build/device
