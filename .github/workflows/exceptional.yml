@@ -20,8 +20,11 @@ jobs:
         run: python -c "import torch; assert '+cpu' in torch.__version__; assert torch.cuda.is_available() is False; print(torch.__version__)"
       - name: Compile and tests
         run: |
-          python -m py_compile main.py yolo/*.py
+          python -m py_compile main.py yolo/*.py tests/*.py
           python tests/selftest.py
+          # Regression guard: fails if server.ts was truncated or lost a route
+          # the frontend calls (the 2026-09-27 outage cause).
+          python tests/test_server_routes.py
 
   android:
     runs-on: ubuntu-latest
