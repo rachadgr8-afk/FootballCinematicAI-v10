@@ -594,7 +594,14 @@ function isRetryableGeminiError(err: any): boolean {
  * with key A. `geminiRotator.run` therefore wraps the ENTIRE unit (upload +
  * poll + generateContent) so a fresh attempt re-uploads with the next key.
  */
-async function generateGeminiJsonWithVideo(localPath: string, prompt: string, systemInstruction: string, model: string, mimeType: string = 'video/mp4') {
+async function generateGeminiJsonWithVideo(
+  localPath: string,
+  prompt: string,
+  systemInstruction: string,
+  model: string,
+  mimeType: string = 'video/mp4',
+  onProgress?: (p: { percent: number; stage: string }) => void
+) {
   if (!anyGeminiKeyConfigured()) throw new Error('No Gemini API key is configured on the backend.');
   if (!fs.existsSync(localPath)) throw new Error(`Uploaded video is missing on server: ${localPath}`);
 
@@ -603,15 +610,22 @@ async function generateGeminiJsonWithVideo(localPath: string, prompt: string, sy
   return geminiRotator.run(`analyze-video(${model})`, async (client, state) => {
     let videoFile: any;
     try {
+      onProgress?.({ percent: 8, stage: `Uploading source video to Gemini (key ${state.index + 1}/${geminiRotator.count()})...` });
       videoFile = await client.files.upload({ file: localPath, config: { mimeType } });
+      onProgress?.({ percent: 12, stage: 'Gemini is processing the uploaded footage...' });
       const deadline = Date.now() + 180000;
+      let progressTick = 0;
       while (String(videoFile.state || '') !== 'ACTIVE') {
         if (String(videoFile.state) === 'FAILED') throw new Error('Gemini failed to process the uploaded video.');
         if (Date.now() > deadline) throw new Error('Timed out while Gemini was processing the uploaded video.');
         await new Promise((r) => setTimeout(r, 3000));
         videoFile = await client.files.get({ name: videoFile.name });
+        progressTick += 1;
+        const pct = Math.min(14, 12 + progressTick);
+        onProgress?.({ percent: pct, stage: `Gemini is processing the footage... (${progressTick * 3}s)` });
       }
 
+      onProgress?.({ percent: 15, stage: 'Gemini is analyzing the match footage and building the edit plan...' });
       let lastErr: any;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -1180,10 +1194,18 @@ Style requested: ${style}. Generation tier: ${generationTier}. Optional style pr
 - Text is a FIRST-PERSON INNER MONOLOGUE ("COME CLOSER", "ONE MORE STEP AND YOU ARE MINE", "NOW"). Keep it 2-7 words, ALL CAPS, and put it on most shots centered in the LOWER THIRD. Also fill the "narration" field on each shot with the same short spoken line (the voice-over).
 - Story arc: the approach -> the trap/lure -> eye-contact standoff -> the feint -> the fall -> the impact -> the reaction/celebration -> a closing line. The single strongest verified moment is the climax.
 - Copy only the editing language. Never invent a goal, player name, score, kit, logo, watermark, or event that is not visible. If the footage does not clearly contain a duel, build the tense montage from the closest available real action and close-up details.`;
+    // Reset the live progress for this new run so a previous "Idle"/error state
+    // never sticks while the (slow) analysis is genuinely in progress.
+    currentRenderProgress = { percent: 2, stage: 'Starting the master render pipeline...' };
+
     let trackingResult: any = null;
     if (trackingEnabled && process.env.YOLO_ENABLED !== 'false') {
+      currentRenderProgress = { percent: 4, stage: 'YOLOv8 tracking real players and the ball...' };
       try { trackingResult = await runYoloTracking(localPath); }
       catch (trackErr: any) { console.warn('[YOLO] Tracking skipped:', trackErr.message); }
+    }
+    if (trackingResult) {
+      currentRenderProgress = { percent: 7, stage: 'Building the football evidence timeline...' };
     }
     const footballEvidence = trackingResult ? await runFootballEvidence(localPath, trackingResult) : null;
     const compactTracking = trackingResult ? {
@@ -1209,7 +1231,15 @@ Required JSON shape:
 For each text field, write a short editorial caption that does not assert an unverified fact. The "narration" field is the spoken inner-monologue line for that shot (may be empty for non-narrative styles). Source timestamps are the truth; do not use metadata as evidence. Make the first 3 seconds highly arresting and reserve the strongest verified moment for the climax.`;
 
     const model = process.env.GEMINI_VIDEO_MODEL || 'gemini-3.8-flash';
-    const parsed = await generateGeminiJsonWithVideo(localPath, prompt, systemInstruction, model, videoMetadata?.mimeType || 'video/mp4');
+    const parsed = await generateGeminiJsonWithVideo(
+      localPath,
+      prompt,
+      systemInstruction,
+      model,
+      videoMetadata?.mimeType || 'video/mp4',
+      (p) => { currentRenderProgress = p; }
+    );
+    currentRenderProgress = { percent: 22, stage: 'Validating the 64-second edit plan...' };
     parsed.generationTier = generationTier;
     parsed.styleName = style;
     const validatedPlan = validateAndEnforce64sEditPlan(parsed, duration, style);
