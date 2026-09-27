@@ -8,4 +8,7 @@ torchvision==0.21.0+cpu
 
 ultralytics>=8.3.0
 opencv-python-headless>=4.10.0
-git+https://github.com/megvii-research/ECCV2022-RIFE.git
+
+# RIFE is optional and NOT a Python package: it is invoked as a subprocess from a
+# separately cloned repository (see RIFE_INSTALL.md / RIFE_REPO env var). Installing
+# it via pip fails because the upstream repo has no setup.py/pyproject.toml.
