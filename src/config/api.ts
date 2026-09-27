@@ -11,7 +11,7 @@
  * origin), every relative call such as `/api/upload-video` or `/videos/x.mp4`
  * must resolve to the SAME server that served the page.
  *
- * The production Android build uses the configured Render backend `https://fotbal-1.onrender.com`; Vite can still override it with `VITE_API_BASE_URL` for another deployment. The old hardcoded fallback was the root cause
+ * The production Android build uses the configured Render backend `https://footballcinematicai-v10.onrender.com`; Vite can still override it with `VITE_API_BASE_URL` for another deployment. The old hardcoded fallback was the root cause
  * of the "Upload service endpoint was not found on the server" 404: whenever the
  * external Render backend was asleep, rebuilt, or its free instance expired, all
  * uploads/render calls hit a dead host and 404'd — even though the local
@@ -20,7 +20,7 @@
  * For the packaged Capacitor app (WebView origin `https://localhost`), the build
  * injects VITE_API_BASE_URL so relative paths still reach the backend.
  */
-export const DEFAULT_API_BASE_URL: string = 'https://fotbal-1.onrender.com';
+export const DEFAULT_API_BASE_URL: string = 'https://footballcinematicai-v10.onrender.com';
 
 export const API_BASE_URL: string =
   (import.meta.env.VITE_API_BASE_URL as string) ?? DEFAULT_API_BASE_URL;

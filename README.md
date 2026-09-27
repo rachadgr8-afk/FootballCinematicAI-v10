@@ -24,7 +24,7 @@ View your app in AI Studio: https://ai.studio/apps/dc01fd3e-8555-4028-a8b2-8a89e
 
 The Android app checks `/api/version` before rendering. The expected backend build is
 `2026-09-26-cinematic-v3`. After deploying this source to Render, verify:
-`GET https://fotbal-1.onrender.com/api/version`
+`GET https://footballcinematicai-v10.onrender.com/api/version`
 and confirm the returned `buildVersion` is `2026-09-26-cinematic-v3`.
 
 If the backend reports an older build, the app stops instead of silently producing the
