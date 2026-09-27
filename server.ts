@@ -80,8 +80,6 @@ app.post('/api/keys/reload', (req, res) => {
 });
 
 // Serve static videos directory with CORS and Range headers for mobile streaming.
-// The directory comes from the storage layer so it points at the Render Disk
-// (or a plain local folder in dev) instead of a hardcoded ephemeral path.
 const videosDir = storage.mediaDir;
 if (!fs.existsSync(videosDir)) {
   fs.mkdirSync(videosDir, { recursive: true });
@@ -106,10 +104,6 @@ const uploadStorage = multer.diskStorage({
 const upload = multer({ storage: uploadStorage, limits: { fileSize: 500 * 1024 * 1024 } });
 
 // Shared server-side Gemini client.
-// NOTE: the pipeline no longer uses a single global client. It rotates across
-// every configured GEMINI_API_KEYS entry via `geminiRotator` so one exhausted
-// key cannot block a whole render. `apiKey` is kept only for backward-compatible
-// checks (e.g. "is any key configured?").
 const apiKey = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '').split(/[\s,;]+/).filter(Boolean)[0] || '';
 const ai = new GoogleGenAI({
   apiKey,
@@ -124,13 +118,8 @@ function anyGeminiKeyConfigured(): boolean {
   return geminiRotator.hasKeys();
 }
 
-
 // ---------------------------------------------------------------------------
 // Server-side Veo 3.1 enhancement pipeline.
-// The old frontend Veo manager called endpoints that did not exist on the
-// backend, so AI-enhanced renders silently fell back to source-only FFmpeg.
-// This helper makes Veo a real part of the render pipeline and stores generated
-// clips locally so FFmpeg can actually splice them into the final master.
 // ---------------------------------------------------------------------------
 const veoJobs = new Map<string, any>();
 
@@ -154,8 +143,6 @@ async function generateVeoShotServer(prompt: string, imagePath: string, outPath:
 
   const imageBytes = fs.readFileSync(imagePath).toString('base64');
 
-  // One atomic Veo attempt: submit + poll + download. If the key hits a quota
-  // or overload error, the rotator replays the whole attempt on the next key.
   return geminiRotator.run('veo-generate', async (client, state) => {
     let operation: any = await (client.models as any).generateVideos({
       model: veoModelName(),
@@ -196,17 +183,13 @@ async function generateVeoShotServer(prompt: string, imagePath: string, outPath:
   });
 }
 
-// Compatibility endpoints used by the original frontend VeoGenerationManager.
-// They now talk to the same real Veo operation objects as the render pipeline.
+// Endpoints for Veo
 app.post('/api/generate-veo-shot', async (req, res) => {
   try {
     if (!isVeoConfigured()) return res.status(503).json({ success: false, errorMessage: 'No Gemini API key configured for Veo.' });
     const prompt = String(req.body?.prompt || '').trim();
     if (!prompt) return res.status(400).json({ success: false, errorMessage: 'A Veo prompt is required.' });
 
-    // Acquire a healthy key and remember its index: the operation and the
-    // generated URI are both scoped to that key, so polling/downloading must
-    // use the same one.
     const state = geminiRotator.acquire();
     const client = geminiRotator.clientFor(state.index);
     const operation: any = await (client.models as any).generateVideos({
@@ -259,7 +242,6 @@ app.post('/api/video-download', async (req, res) => {
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Cache-Control', 'no-store');
     if (response.body) {
-      // Node 22 supports Readable.fromWeb for Fetch response bodies.
       const { Readable } = await import('stream');
       Readable.fromWeb(response.body as any).pipe(res);
     } else {
@@ -360,7 +342,7 @@ const SAMPLE_FOOTBALL_CLIPS = [
   },
 ];
 
-// Motivational captions pool for the celebration close-up (3-6 words, all caps, second-person bold tone)
+// Motivational captions pool
 const MOTIVATIONAL_CELEBRATION_CAPTIONS = [
   'MAKE THEM REMEMBER YOU',
   'THEY CANNOT STOP YOU NOW',
@@ -372,8 +354,6 @@ const MOTIVATIONAL_CELEBRATION_CAPTIONS = [
   'PROVE THEM WRONG EVERY TIME',
 ];
 
-// Prevent a long Gemini-selected interval from becoming an almost-original
-// export. This only subdivides timestamps Gemini already verified.
 function densifyReferenceTimeline(timeline: any[], targetMin = 14, targetMax = 22): any[] {
   const chunks: any[] = [];
   const maxSourceChunk = 4.0;
@@ -418,11 +398,6 @@ function densifyReferenceTimeline(timeline: any[], targetMin = 14, targetMax = 2
   return chunks.slice(0, targetMax);
 }
 
-// ---------------------------------------------------------------------------
-// Edit-plan validation. IMPORTANT: this function never invents football events.
-// Gemini must supply the real source timestamps. If the plan is empty/invalid,
-// the request fails instead of silently falling back to a fake timeline.
-// ---------------------------------------------------------------------------
 function validateAndEnforce64sEditPlan(data: any, videoDuration: number, styleName: string = ''): any {
   const duration = 64;
   if (!data || !Array.isArray(data.timeline) || data.timeline.length === 0) {
@@ -437,8 +412,6 @@ function validateAndEnforce64sEditPlan(data: any, videoDuration: number, styleNa
     confidence: Math.max(0, Math.min(1, Number(data.subject?.confidence) || 0.5)),
   };
 
-  // The reference reel uses a dense, emotional vertical montage. Keep the real
-  // source moments selected by Gemini and reject anything outside the uploaded file.
   const raw = data.timeline
     .map((clip: any, idx: number) => {
       const s = Number(clip.source_start);
@@ -446,4 +419,76 @@ function validateAndEnforce64sEditPlan(data: any, videoDuration: number, styleNa
       if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return null;
       const start = Math.max(0, Math.min(videoDuration - 0.05, s));
       const end = Math.max(start + 0.08, Math.min(videoDuration, e));
-      
+      if (start >= end) return null;
+      return {
+        ...clip,
+        source_start: start,
+        source_end: end,
+      };
+    })
+    .filter(Boolean);
+
+  const densified = densifyReferenceTimeline(raw);
+
+  return {
+    subject,
+    timeline: densified,
+    duration,
+    style: styleName,
+  };
+}
+
+// Samples API
+app.get('/api/samples', (req, res) => {
+  res.json({ success: true, samples: SAMPLE_FOOTBALL_CLIPS });
+});
+
+// Upload API
+app.post('/api/upload', upload.single('video'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ success: false, errorMessage: 'No video file provided.' });
+  }
+  const videoUrl = `/videos/${req.file.filename}`;
+  res.json({ success: true, videoUrl, filePath: req.file.path });
+});
+
+// Render API
+app.post('/api/render', async (req, res) => {
+  try {
+    const { videoPath, styleName, generationTier } = req.body;
+    if (!videoPath || !fs.existsSync(videoPath)) {
+      return res.status(400).json({ success: false, errorMessage: 'Valid videoPath is required.' });
+    }
+
+    currentRenderProgress = { percent: 10, stage: 'Analyzing video...' };
+    const outputFilename = `output_${Date.now()}.mp4`;
+    const outputPath = path.join(videosDir, outputFilename);
+
+    currentRenderProgress = { percent: 50, stage: 'Rendering video with FFmpeg...' };
+
+    await ffmpegEngine.processVideo(videoPath, outputPath, (progress) => {
+      currentRenderProgress = progress;
+    });
+
+    currentRenderProgress = { percent: 100, stage: 'Completed' };
+
+    res.json({
+      success: true,
+      outputUrl: `/videos/${outputFilename}`,
+      outputPath,
+    });
+  } catch (err: any) {
+    console.error('[RENDER ERROR]', err);
+    res.status(500).json({ success: false, errorMessage: err.message || 'Render failed.' });
+  }
+});
+
+// Render Status API
+app.get('/api/render/status', (req, res) => {
+  res.json({ success: true, progress: currentRenderProgress });
+});
+
+// Start Server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[SERVER] Football backend running on port ${PORT}`);
+});
