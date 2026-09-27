@@ -22,6 +22,10 @@ def main():
     # with a stride. On CPU this turns a multi-hour job into a few minutes.
     ap.add_argument("--max-seconds", type=float, default=float(os.environ.get("YOLO_MAX_SECONDS", "120")))
     ap.add_argument("--stride", type=int, default=int(os.environ.get("YOLO_STRIDE", "3")))
+    # Absolute wall-clock budget for the WHOLE tracking pass. On a slow CPU-only
+    # host each frame can take tens of seconds, so we must stop by time, not just
+    # by frame count — otherwise the render appears frozen for hours.
+    ap.add_argument("--deadline-seconds", type=float, default=float(os.environ.get("YOLO_DEADLINE_SECONDS", "90")))
     ap.add_argument("--save-video", action="store_true", default=os.environ.get("YOLO_SAVE_VIDEO") == "true")
     args = ap.parse_args()
 
@@ -71,6 +75,8 @@ def main():
     frame_idx = 0
     analyzed = 0
     last_beat = time.time()
+    started_at = time.time()
+    time_exhausted = False
 
     for r in results:
         frame_idx += 1
@@ -83,8 +89,13 @@ def main():
             pct = 10 + min(80, int((analyzed / max(1, max_frames)) * 80))
             log_progress(pct, f"{analyzed} frames analyzed")
 
-        # Hard stop once the bounded work is done.
+        # STOP on EITHER bound: enough frames analyzed OR the wall-clock budget
+        # is spent. This guarantees the pass can never run for hours.
         if analyzed >= max_frames:
+            break
+        if (time.time() - started_at) >= args.deadline_seconds:
+            time_exhausted = True
+            log_progress(90, f"time budget reached after {analyzed} frames")
             break
 
         names = r.names or {}
@@ -132,6 +143,8 @@ def main():
             "summary": {"fps": fps, "width": width, "height": height,
                         "frames": analyzed, "sourceFrames": total or frame_idx,
                         "maxSeconds": args.max_seconds, "stride": stride,
+                        "timeExhausted": time_exhausted,
+                        "elapsedSeconds": round(time.time() - started_at, 2),
                         "detections": counts, "samples": samples, "tracks": tracks}}
     (out / "tracking.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf8")
     log_progress(95, "done")

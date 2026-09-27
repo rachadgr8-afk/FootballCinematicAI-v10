@@ -1014,11 +1014,15 @@ function runYoloTracking(
     // whole pipeline (previously it could run for hours on a long CPU-only match).
     const maxSeconds = Number(process.env.YOLO_MAX_SECONDS || 120);
     const stride = Number(process.env.YOLO_STRIDE || 3);
-    const timeoutMs = Number(process.env.YOLO_TIMEOUT_MS || 300000); // 5 min
+    // Wall-clock budget for the whole tracking pass. Kept SHORT because CPU-only
+    // hosts can take tens of seconds per frame; a long budget = a frozen UI.
+    const deadlineSeconds = Number(process.env.YOLO_DEADLINE_SECONDS || 90);
+    const timeoutMs = Number(process.env.YOLO_TIMEOUT_MS || 180000); // 3 min hard cap
 
     const child = spawn(process.env.PYTHON_BIN || 'python3',
       [script, '--source', inputPath, '--model', modelPath, '--output-dir', outputDir, '--json',
-       '--max-seconds', String(maxSeconds), '--stride', String(stride)],
+       '--max-seconds', String(maxSeconds), '--stride', String(stride),
+       '--deadline-seconds', String(deadlineSeconds)],
       { env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
 
     let stdout = '', stderr = '', settled = false;

@@ -48,7 +48,9 @@ services:
       - key: YOLO_STRIDE
         value: "3"
       - key: YOLO_TIMEOUT_MS
-        value: "300000"
+        value: "180000"
+      - key: YOLO_DEADLINE_SECONDS
+        value: "90"
       - key: EVIDENCE_TIMEOUT_MS
         value: "120000"
       # --- Storage / persistence ---
