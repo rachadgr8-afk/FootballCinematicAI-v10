@@ -32,8 +32,10 @@ services:
         value: JBFqnCBsd6RMkjVDRZzb
       - key: ELEVENLABS_MODEL_ID
         value: eleven_multilingual_v2
+      # YOLO per-frame tracking is CPU-heavy (~50s/frame on the free Render CPU),
+      # so it is OFF by default; the pipeline uses Gemini native video analysis.
       - key: YOLO_ENABLED
-        value: "true"
+        value: "false"
       - key: YOLO_MODEL_PATH
         value: /app/models/best.pt
       - key: PYTHON_BIN

@@ -1168,7 +1168,7 @@ async function muxCommentary(videoPath: string, audioPath: string): Promise<stri
 
 
 app.get('/api/yolo/status', (req, res) => {
-  res.json({ success: true, enabled: process.env.YOLO_ENABLED !== 'false', model: process.env.YOLO_MODEL_PATH || 'models/best.pt', tracker: 'ByteTrack' });
+  res.json({ success: true, enabled: process.env.YOLO_ENABLED === 'true', model: process.env.YOLO_MODEL_PATH || 'models/best.pt', tracker: 'ByteTrack' });
 });
 
 
@@ -1253,7 +1253,12 @@ Style requested: ${style}. Generation tier: ${generationTier}. Optional style pr
     currentRenderProgress = { percent: 2, stage: 'Starting the master render pipeline...' };
 
     let trackingResult: any = null;
-    if (trackingEnabled && process.env.YOLO_ENABLED !== 'false') {
+    // YOLO is an OPTIONAL evidence enhancer. On CPU-only instances it is far too
+    // slow (~50s/frame) to be practical, so it runs only when EXPLICITLY enabled
+    // (YOLO_ENABLED=true) AND the client opts in. The default pipeline relies on
+    // Gemini's native video analysis, which needs no per-frame CPU work.
+    const yoloExplicitlyEnabled = process.env.YOLO_ENABLED === 'true';
+    if (trackingEnabled && yoloExplicitlyEnabled) {
       currentRenderProgress = { percent: 4, stage: 'YOLOv8 tracking real players and the ball...' };
       try {
         trackingResult = await runYoloTracking(localPath, (p) => { currentRenderProgress = p; });
