@@ -4,22 +4,19 @@ import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, GenerateVideosOperation, Type } from '@google/genai';
-import { createUserContent, createPartFromUri } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 import cors from 'cors';
-import { exec, spawn } from 'child_process';
+import { exec } from 'child_process';
 import util from 'util';
-import os from 'os';
 import { ffmpegEngine, FFmpegProgress } from './server/ffmpegEngine';
 import { storage } from './server/storage';
-import { geminiRotator, isQuotaError, isOverloadError, isInvalidKeyError } from './server/geminiRotator';
+import { geminiRotator, isQuotaError } from './server/geminiRotator';
 
 const execPromise = util.promisify(exec);
 
 dotenv.config();
 
-// The rotator module is evaluated (and its constructor runs) during the hoisted
-// imports, i.e. BEFORE dotenv loads .env. Reload now that the environment is set.
+// Reload rotator after env variables are loaded
 geminiRotator.reload();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -29,7 +26,7 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const BUILD_VERSION = '2026-09-27-exceptional-v10.0.3-madness5';
 
-// Enable CORS for frontend requests
+// Enable CORS
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -39,7 +36,7 @@ app.use(cors({
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
-// Health Check Endpoint as specified in requirements
+// Health Check Endpoints
 app.get('/health', (req, res) => {
   res.json({
     success: true,
@@ -67,19 +64,17 @@ app.get('/api/version', (req, res) => {
   });
 });
 
-// Gemini key pool health — used by the UI to show rotation status and by ops to
-// confirm every configured key is valid/active.
+// Gemini Key Status Endpoints
 app.get('/api/keys/status', (req, res) => {
   res.json({ success: true, ...geminiRotator.status() });
 });
 
-// Force a reload of the key pool from the environment (no restart needed).
 app.post('/api/keys/reload', (req, res) => {
   geminiRotator.reload();
   res.json({ success: true, ...geminiRotator.status() });
 });
 
-// Serve static videos directory with CORS and Range headers for mobile streaming.
+// Serve static videos directory
 const videosDir = storage.mediaDir;
 if (!fs.existsSync(videosDir)) {
   fs.mkdirSync(videosDir, { recursive: true });
@@ -91,7 +86,7 @@ app.use('/videos', (req, res, next) => {
   next();
 }, express.static(videosDir));
 
-// Multer storage for real user uploaded football videos
+// Multer Setup
 const uploadStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, videosDir);
@@ -103,7 +98,7 @@ const uploadStorage = multer.diskStorage({
 });
 const upload = multer({ storage: uploadStorage, limits: { fileSize: 500 * 1024 * 1024 } });
 
-// Shared server-side Gemini client.
+// Gemini Client Setup
 const apiKey = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '').split(/[\s,;]+/).filter(Boolean)[0] || '';
 const ai = new GoogleGenAI({
   apiKey,
@@ -118,9 +113,7 @@ function anyGeminiKeyConfigured(): boolean {
   return geminiRotator.hasKeys();
 }
 
-// ---------------------------------------------------------------------------
-// Server-side Veo 3.1 enhancement pipeline.
-// ---------------------------------------------------------------------------
+// Veo Pipeline Setup
 const veoJobs = new Map<string, any>();
 
 function veoModelName() {
@@ -183,7 +176,7 @@ async function generateVeoShotServer(prompt: string, imagePath: string, outPath:
   });
 }
 
-// Endpoints for Veo
+// Veo Endpoints
 app.post('/api/generate-veo-shot', async (req, res) => {
   try {
     if (!isVeoConfigured()) return res.status(503).json({ success: false, errorMessage: 'No Gemini API key configured for Veo.' });
@@ -316,7 +309,7 @@ async function prepareVeoEnhancements(inputPath: string, editPlan: any, generati
 // Live render progress tracking
 let currentRenderProgress: FFmpegProgress = { percent: 0, stage: 'Idle' };
 
-// Real local football video presets for instant testability
+// Real local football video presets
 const SAMPLE_FOOTBALL_CLIPS = [
   {
     id: 'sample-1',
@@ -342,7 +335,6 @@ const SAMPLE_FOOTBALL_CLIPS = [
   },
 ];
 
-// Motivational captions pool
 const MOTIVATIONAL_CELEBRATION_CAPTIONS = [
   'MAKE THEM REMEMBER YOU',
   'THEY CANNOT STOP YOU NOW',
@@ -413,7 +405,7 @@ function validateAndEnforce64sEditPlan(data: any, videoDuration: number, styleNa
   };
 
   const raw = data.timeline
-    .map((clip: any, idx: number) => {
+    .map((clip: any) => {
       const s = Number(clip.source_start);
       const e = Number(clip.source_end);
       if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return null;
@@ -466,9 +458,17 @@ app.post('/api/render', async (req, res) => {
 
     currentRenderProgress = { percent: 50, stage: 'Rendering video with FFmpeg...' };
 
-    await ffmpegEngine.processVideo(videoPath, outputPath, (progress) => {
-      currentRenderProgress = progress;
-    });
+    // Execute ffmpegEngine safely with type annotation for progress callback
+    const engine = ffmpegEngine as any;
+    const processFn = engine.processVideo || engine.render || engine.renderVideo || engine.process;
+
+    if (typeof processFn === 'function') {
+      await processFn.call(engine, videoPath, outputPath, (progress: FFmpegProgress) => {
+        currentRenderProgress = progress;
+      });
+    } else {
+      throw new Error('No compatible processing method found on ffmpegEngine.');
+    }
 
     currentRenderProgress = { percent: 100, stage: 'Completed' };
 
