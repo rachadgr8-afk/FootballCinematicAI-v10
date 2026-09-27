@@ -1000,26 +1000,75 @@ async function elevenTTS(text: string, voiceId?: string, delivery?: Partial<Voic
   throw lastErr || new Error('No healthy ElevenLabs key available');
 }
 
-function runYoloTracking(inputPath: string): Promise<any> {
+function runYoloTracking(
+  inputPath: string,
+  onProgress?: (p: { percent: number; stage: string }) => void
+): Promise<any> {
   return new Promise((resolve, reject) => {
     const script = path.join(__dirname, 'yolo', 'track_football.py');
     const modelPath = process.env.YOLO_MODEL_PATH || path.join(__dirname, 'models', 'best.pt');
     const outputDir = path.join(videosDir, `yolo_${Date.now()}`);
     fs.mkdirSync(outputDir, { recursive: true });
+
+    // Bounded CPU work + a hard wall-clock timeout so tracking can NEVER hang the
+    // whole pipeline (previously it could run for hours on a long CPU-only match).
+    const maxSeconds = Number(process.env.YOLO_MAX_SECONDS || 120);
+    const stride = Number(process.env.YOLO_STRIDE || 3);
+    const timeoutMs = Number(process.env.YOLO_TIMEOUT_MS || 300000); // 5 min
+
     const child = spawn(process.env.PYTHON_BIN || 'python3',
-      [script, '--source', inputPath, '--model', modelPath, '--output-dir', outputDir, '--json'],
+      [script, '--source', inputPath, '--model', modelPath, '--output-dir', outputDir, '--json',
+       '--max-seconds', String(maxSeconds), '--stride', String(stride)],
       { env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '';
+
+    let stdout = '', stderr = '', settled = false;
+    let lastLines: string[] = [];
+
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      finish(() => reject(new Error(
+        `YOLO tracking timed out after ${Math.round(timeoutMs / 1000)}s. ` +
+        `Lower YOLO_MAX_SECONDS or increase YOLO_TIMEOUT_MS.`
+      )));
+    }, timeoutMs);
+
     child.stdout.on('data', d => { stdout += d.toString(); });
-    child.stderr.on('data', d => { stderr += d.toString(); });
-    child.on('error', reject);
+    child.stderr.on('data', d => {
+      stderr += d.toString();
+      // Parse our "PROGRESS <pct> <msg>" heartbeat lines into live UI updates.
+      for (const line of d.toString().split('\n')) {
+        if (line.startsWith('PROGRESS ')) {
+          const parts = line.replace('PROGRESS ', '').trim().split(' ');
+          const pct = Number(parts.shift());
+          if (Number.isFinite(pct)) {
+            onProgress?.({ percent: Math.max(4, Math.min(20, pct)), stage: `YOLOv8 tracking: ${parts.join(' ')}` });
+          }
+        } else if (line.trim()) {
+          lastLines.push(line.trim());
+          if (lastLines.length > 20) lastLines.shift();
+        }
+      }
+    });
+
+    child.on('error', (err) => finish(() => reject(err)));
     child.on('close', code => {
-      if (code !== 0) return reject(new Error(`YOLO tracker exited ${code}: ${stderr.slice(-1500)}`));
-      try {
-        const result = JSON.parse(stdout.trim().split('\n').filter(Boolean).pop() || '{}');
-        if (!result.success) return reject(new Error(result.error || 'YOLO tracking failed'));
-        resolve(result);
-      } catch { reject(new Error(`YOLO tracker returned invalid JSON: ${stdout.slice(-1000)}`)); }
+      finish(() => {
+        if (code !== 0) {
+          return reject(new Error(`YOLO tracker exited ${code}: ${(stderr || lastLines.join(' ')).slice(-1500)}`));
+        }
+        try {
+          const result = JSON.parse(stdout.trim().split('\n').filter(Boolean).pop() || '{}');
+          if (!result.success) return reject(new Error(result.error || 'YOLO tracking failed'));
+          resolve(result);
+        } catch { reject(new Error(`YOLO tracker returned invalid JSON: ${stdout.slice(-1000)}`)); }
+      });
     });
   });
 }
@@ -1134,10 +1183,15 @@ async function runFootballEvidence(inputPath: string, trackingResult: any): Prom
     const eventsPath=path.join(work,'events.json');
     const directorPath=path.join(work,'director.json');
     const py=process.env.PYTHON_BIN||'python3';
-    await execPromise(`${JSON.stringify(py)} ${JSON.stringify(path.join(__dirname,'yolo/event_engine.py'))} --tracking ${JSON.stringify(trackingPath)} --output ${JSON.stringify(eventsPath)}`);
+    const pyTimeout = Number(process.env.EVIDENCE_TIMEOUT_MS || 120000);
+    await execPromise(`${JSON.stringify(py)} ${JSON.stringify(path.join(__dirname,'yolo/event_engine.py'))} --tracking ${JSON.stringify(trackingPath)} --output ${JSON.stringify(eventsPath)}`, { timeout: pyTimeout });
     const summary=trackingResult.summary||{};
-    const duration=(Number(summary.frames)||0)/Math.max(.1,Number(summary.fps)||25);
-    await execPromise(`${JSON.stringify(py)} ${JSON.stringify(path.join(__dirname,'yolo/football_director.py'))} --events ${JSON.stringify(eventsPath)} --output ${JSON.stringify(directorPath)} --duration ${duration.toFixed(3)}`);
+    // Prefer the real source duration; fall back to analyzed frames/fps.
+    const analyzedFrames = Number(summary.sourceFrames) || Number(summary.frames) || 0;
+    const duration = analyzedFrames > 0
+      ? analyzedFrames / Math.max(.1, Number(summary.fps) || 25)
+      : Number(process.env.YOLO_MAX_SECONDS || 120);
+    await execPromise(`${JSON.stringify(py)} ${JSON.stringify(path.join(__dirname,'yolo/football_director.py'))} --events ${JSON.stringify(eventsPath)} --output ${JSON.stringify(directorPath)} --duration ${duration.toFixed(3)}`, { timeout: pyTimeout });
     const director = JSON.parse(fs.readFileSync(directorPath,'utf8'));
     director.eventsPath = eventsPath;
     director.directorPath = directorPath;
@@ -1158,7 +1212,7 @@ async function runMadnessEngine(eventsPath: string, timeline: any[]) {
     fs.writeFileSync(timelineInput, JSON.stringify({ timeline }, null, 2), 'utf8');
     const script = path.join(__dirname, 'yolo/madness_engine.py');
     if (!fs.existsSync(script) || !fs.existsSync(eventsPath)) return null;
-    await execPromise(`${JSON.stringify(py)} ${JSON.stringify(script)} --events ${JSON.stringify(eventsPath)} --timeline ${JSON.stringify(timelineInput)} --output ${JSON.stringify(madnessPath)}`);
+    await execPromise(`${JSON.stringify(py)} ${JSON.stringify(script)} --events ${JSON.stringify(eventsPath)} --timeline ${JSON.stringify(timelineInput)} --output ${JSON.stringify(madnessPath)}`, { timeout: Number(process.env.EVIDENCE_TIMEOUT_MS || 120000) });
     if (!fs.existsSync(madnessPath)) return null;
     return JSON.parse(fs.readFileSync(madnessPath, 'utf8'));
   } catch (e:any) {
@@ -1201,8 +1255,15 @@ Style requested: ${style}. Generation tier: ${generationTier}. Optional style pr
     let trackingResult: any = null;
     if (trackingEnabled && process.env.YOLO_ENABLED !== 'false') {
       currentRenderProgress = { percent: 4, stage: 'YOLOv8 tracking real players and the ball...' };
-      try { trackingResult = await runYoloTracking(localPath); }
-      catch (trackErr: any) { console.warn('[YOLO] Tracking skipped:', trackErr.message); }
+      try {
+        trackingResult = await runYoloTracking(localPath, (p) => { currentRenderProgress = p; });
+      } catch (trackErr: any) {
+        // YOLO is an OPTIONAL evidence enhancer — its failure must NEVER block the
+        // render. We degrade gracefully to pure Gemini analysis.
+        console.warn('[YOLO] Tracking skipped:', trackErr.message);
+        currentRenderProgress = { percent: 5, stage: 'Tracking skipped — continuing with Gemini analysis...' };
+        trackingResult = null;
+      }
     }
     if (trackingResult) {
       currentRenderProgress = { percent: 7, stage: 'Building the football evidence timeline...' };

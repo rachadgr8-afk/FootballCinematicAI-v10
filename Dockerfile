@@ -106,6 +106,10 @@ RUN mkdir -p /tmp/football_engine/work public/videos /var/data/videos \
 ENV STORAGE_DRIVER=local \
     PUBLIC_DIR=/app/public/videos \
     PYTHON_BIN=/opt/yolo-venv/bin/python \
+    YOLO_MAX_SECONDS=120 \
+    YOLO_STRIDE=3 \
+    YOLO_TIMEOUT_MS=300000 \
+    EVIDENCE_TIMEOUT_MS=120000 \
     RIFE_REPO=/opt/rife \
     RIFE_ENABLED=true \
     RIFE_FPS_MULTIPLIER=2
