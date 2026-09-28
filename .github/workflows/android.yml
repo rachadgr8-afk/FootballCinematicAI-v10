@@ -36,8 +36,10 @@ jobs:
           python3 scripts/verify_cpu_torch.py
           python3 -m py_compile main.py yolo/*.py tests/*.py
 
-      - name: Guard server route contract
-        run: python3 tests/test_server_routes.py
+      - name: Guard server route + key-rotation contracts
+        run: |
+          python3 tests/test_server_routes.py
+          python3 tests/test_gemini_rotator.py
 
       - name: Build web app
         env:

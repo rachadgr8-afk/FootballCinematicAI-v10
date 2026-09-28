@@ -104,9 +104,19 @@ export function isOverloadError(err: any): boolean {
   return /503|UNAVAILABLE|high demand|overloaded|temporar|internal error|500|502|504|DEADLINE_EXCEEDED|timeout/i.test(s);
 }
 
-/** Errors that justify rotating to another key and replaying the operation. */
+/**
+ * Errors that justify rotating to another key and replaying the operation.
+ *
+ * IMPORTANT: a permanently invalid/dead key (API_KEY_INVALID / 401 / 403) MUST
+ * be rotatable. The key pool is expected to contain a mix of valid and expired
+ * keys, and the whole point of the rotator is to skip a dead key and use a live
+ * one. Omitting `isInvalidKeyError` here made `run()` rethrow on the first dead
+ * key instead of continuing, so a pool with ANY expired key failed the entire
+ * render — the second cause of the "generation stops / app no longer works"
+ * outage.
+ */
 export function isRotatableError(err: any): boolean {
-  return isQuotaError(err) || isOverloadError(err);
+  return isInvalidKeyError(err) || isQuotaError(err) || isOverloadError(err);
 }
 
 function safeStringify(obj: any): string {

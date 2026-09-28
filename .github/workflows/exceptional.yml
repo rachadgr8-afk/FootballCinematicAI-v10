@@ -25,6 +25,9 @@ jobs:
           # Regression guard: fails if server.ts was truncated or lost a route
           # the frontend calls (the 2026-09-27 outage cause).
           python tests/test_server_routes.py
+          # Regression guard: a pool with any expired Gemini key must still rotate.
+          python tests/test_gemini_rotator.py
+          python tests/test_gemini_rotator.py
 
   android:
     runs-on: ubuntu-latest
