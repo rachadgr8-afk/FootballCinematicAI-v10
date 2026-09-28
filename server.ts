@@ -784,72 +784,210 @@ async function runRifeInterpolation(inputPath: string, outputPath: string, exp: 
   return { applied: true, outputPath };
 }
 
-// 6. POST /api/render-full-cinematic
-// Executes complete real FFmpeg video processing pipeline
-app.post('/api/render-full-cinematic', async (req, res) => {
+// ---------------------------------------------------------------------------
+// 6. FULL CINEMATIC RENDER — ASYNC JOB MODEL
+// ---------------------------------------------------------------------------
+// WHY: A full 64s montage legitimately takes 1.5-8 minutes of real FFmpeg work.
+// An HTTP request held open that long is severed by hosting proxies (Render,
+// nginx, Cloudflare) which cap origin response time — the browser then reports
+// exactly the "Failed to fetch" seen in production, even though the server
+// eventually finished. The fix is to DECOUPLE the render from the request:
+//
+//   POST /api/render-full-cinematic  -> starts a job, returns { jobId } in <1s
+//   GET  /api/render-progress        -> live { percent, stage, status } (polled)
+//   GET  /api/render-result          -> final payload once status === 'done'
+//
+// Progress is persisted to disk so a Render container restart (which briefly
+// 502s the whole service) is reported as an explicit error instead of an
+// endless "stuck at 73%" spinner.
+// ---------------------------------------------------------------------------
+type RenderJobStatus = 'running' | 'done' | 'error';
+interface RenderJob {
+  jobId: string;
+  status: RenderJobStatus;
+  percent: number;
+  stage: string;
+  startedAt: number;
+  updatedAt: number;
+  result?: any;
+  error?: string;
+}
+
+const RENDER_STATE_DIR = path.resolve(process.env.TMP_WORK_DIR || '/tmp/football_engine/work');
+try { fs.mkdirSync(RENDER_STATE_DIR, { recursive: true }); } catch {}
+const RENDER_STATE_FILE = path.join(RENDER_STATE_DIR, 'render_state.json');
+const RENDER_JOB_STALE_MS = Number(process.env.RENDER_JOB_STALE_MS || 20 * 60 * 1000);
+
+const renderJobs = new Map<string, RenderJob>();
+let activeRenderJobId: string | null = null;
+
+function writeRenderState(job: RenderJob): void {
+  try { fs.writeFileSync(RENDER_STATE_FILE, JSON.stringify(job), 'utf8'); } catch { /* non-fatal */ }
+}
+function clearRenderState(): void {
+  try { if (fs.existsSync(RENDER_STATE_FILE)) fs.rmSync(RENDER_STATE_FILE, { force: true }); } catch { /* non-fatal */ }
+}
+
+/** Reads the job from memory, or the persisted snapshot if the process restarted. */
+function readRenderJob(jobId?: string): RenderJob | null {
+  const id = jobId || activeRenderJobId;
+  if (id && renderJobs.has(id)) return renderJobs.get(id)!;
+  if (!fs.existsSync(RENDER_STATE_FILE)) return null;
   try {
-    const { localPath, editPlan, musicVolume = 0.8, originalVolume = 0.9, generationTier = 'ORIGINAL FOOTAGE ONLY' } = req.body;
-    if (!localPath || !fs.existsSync(localPath)) {
-      return res.status(400).json({ success: false, error: 'Valid uploaded video localPath is required.' });
+    const disk = JSON.parse(fs.readFileSync(RENDER_STATE_FILE, 'utf8')) as RenderJob;
+    if (!disk || (jobId && disk.jobId !== jobId)) return null;
+    // A 'running' job whose process died (server restart / OOM kill) is dead.
+    if (disk.status === 'running' && Date.now() - (disk.updatedAt || 0) > RENDER_JOB_STALE_MS) {
+      disk.status = 'error';
+      disk.stage = 'Render was interrupted (the server restarted mid-render). Please retry.';
+    }
+    return disk;
+  } catch { return null; }
+}
+
+function updateJob(job: RenderJob, patch: Partial<RenderJob>): void {
+  Object.assign(job, patch, { updatedAt: Date.now() });
+  currentRenderProgress = { percent: job.percent, stage: job.stage };
+  writeRenderState(job);
+}
+
+/**
+ * Runs the whole render pipeline OFF the request thread and records the outcome
+ * on the job. Never throws to the caller — failures land on the job object where
+ * the poller surfaces them.
+ */
+async function runFullRenderJob(
+  jobId: string,
+  params: { localPath: string; editPlan: any; musicVolume: number; originalVolume: number; generationTier: string; rifeMultiplier: number }
+): Promise<void> {
+  const job = renderJobs.get(jobId)!;
+  const { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier } = params;
+  let generatedVeoPaths: string[] = [];
+  try {
+    const preparedPlan = await prepareVeoEnhancements(localPath, editPlan, generationTier, (p) => updateJob(job, { percent: p.percent, stage: p.stage }));
+    generatedVeoPaths = preparedPlan.timeline.map((c: any) => c.veo_local_path).filter((p: any) => typeof p === 'string');
+
+    const result = await ffmpegEngine.renderFullCinematic(
+      localPath,
+      preparedPlan,
+      musicVolume,
+      originalVolume,
+      (p) => updateJob(job, { percent: p.percent, stage: p.stage })
+    );
+
+    let publishedPath = result.localPath;
+    let rifeApplied = false;
+    if (process.env.RIFE_ENABLED !== 'false' && (rifeMultiplier === 2 || rifeMultiplier === 4)) {
+      updateJob(job, { percent: 94, stage: `RIFE frame interpolation ${rifeMultiplier}x...` });
+      const rifeOut = path.join(path.dirname(publishedPath), `${path.parse(publishedPath).name}_${rifeMultiplier}x.mp4`);
+      try {
+        const rife = await runRifeInterpolation(publishedPath, rifeOut, rifeMultiplier === 4 ? 2 : 1);
+        if (rife.applied) { publishedPath = rife.outputPath; rifeApplied = true; }
+      } catch (rifeErr: any) {
+        console.warn('[RIFE] interpolation failed; keeping FFmpeg master:', rifeErr?.message || rifeErr);
+      }
     }
 
-    currentRenderProgress = { percent: 0, stage: 'Initializing real FFmpeg render engine...' };
-
-    const preparedPlan = await prepareVeoEnhancements(localPath, editPlan, generationTier, (p) => { currentRenderProgress = p; });
-    const generatedVeoPaths = preparedPlan.timeline.map((c: any) => c.veo_local_path).filter((p: any) => typeof p === 'string');
-
-    try {
-      const result = await ffmpegEngine.renderFullCinematic(
-        localPath,
-        preparedPlan,
-        musicVolume,
-        originalVolume,
-        (p) => {
-          currentRenderProgress = p;
-        }
-      );
-
-      let publishedPath = result.localPath;
-      let rifeApplied = false;
-      const rifeMultiplier = Number(req.body?.rifeMultiplier || process.env.RIFE_FPS_MULTIPLIER || 2);
-      if (process.env.RIFE_ENABLED !== 'false' && (rifeMultiplier === 2 || rifeMultiplier === 4)) {
-        currentRenderProgress = { percent: 94, stage: `RIFE frame interpolation ${rifeMultiplier}x...` };
-        const rifeOut = path.join(path.dirname(publishedPath), `${path.parse(publishedPath).name}_${rifeMultiplier}x.mp4`);
-        try {
-          const rife = await runRifeInterpolation(publishedPath, rifeOut, rifeMultiplier === 4 ? 2 : 1);
-          if (rife.applied) { publishedPath = rife.outputPath; rifeApplied = true; }
-        } catch (rifeErr: any) {
-          console.warn('[RIFE] interpolation failed; keeping FFmpeg master:', rifeErr?.message || rifeErr);
-        }
-      }
-      currentRenderProgress = { percent: 100, stage: rifeApplied ? 'Cinematic render + RIFE complete.' : 'Cinematic render complete.' };
-      res.json({
-        success: true,
-        ...result,
-        localPath: publishedPath,
-        videoUrl: publishedPath ? publishedPath.replace(videosDir, '/videos') : result.videoUrl,
-        generationTier,
-        aiEnhanced: generationTier !== 'ORIGINAL FOOTAGE ONLY' && generatedVeoPaths.length > 0,
-        rifeApplied,
-        rifeMultiplier: rifeApplied ? rifeMultiplier : 0,
-      });
-    } finally {
-      // Generated bridge shots are temporary render assets; the published master is persistent.
-      for (const filePath of generatedVeoPaths) {
-        try { fs.rmSync(filePath, { force: true }); } catch {}
-        try { fs.rmSync(path.dirname(filePath), { recursive: true, force: true }); } catch {}
-      }
-    }
+    const payload = {
+      success: true,
+      ...result,
+      localPath: publishedPath,
+      videoUrl: publishedPath ? publishedPath.replace(videosDir, '/videos') : result.videoUrl,
+      generationTier,
+      aiEnhanced: generationTier !== 'ORIGINAL FOOTAGE ONLY' && generatedVeoPaths.length > 0,
+      rifeApplied,
+      rifeMultiplier: rifeApplied ? rifeMultiplier : 0,
+    };
+    updateJob(job, { percent: 100, status: 'done', stage: rifeApplied ? 'Cinematic render + RIFE complete.' : 'Cinematic render complete.', result: payload });
+    console.log(`[RENDER JOB ${jobId}] done in ${((Date.now() - job.startedAt) / 1000).toFixed(1)}s`);
   } catch (err: any) {
-    console.error('Full cinematic render failed:', err);
-    currentRenderProgress = { percent: 0, stage: `Render Error: ${err.message}` };
-    res.status(500).json({ error: err.message });
+    console.error(`[RENDER JOB ${jobId}] failed:`, err);
+    updateJob(job, { status: 'error', error: err?.message || 'Render failed.' });
+  } finally {
+    // Generated bridge shots are temporary render assets; the published master is persistent.
+    for (const filePath of generatedVeoPaths) {
+      try { fs.rmSync(filePath, { force: true }); } catch {}
+      try { fs.rmSync(path.dirname(filePath), { recursive: true, force: true }); } catch {}
+    }
+    if (activeRenderJobId === jobId) activeRenderJobId = null;
   }
+}
+
+// 6. POST /api/render-full-cinematic — starts a render job, returns immediately.
+app.post('/api/render-full-cinematic', async (req, res) => {
+  const { localPath, editPlan, musicVolume = 0.8, originalVolume = 0.9, generationTier = 'ORIGINAL FOOTAGE ONLY', rifeMultiplier } = req.body || {};
+  if (!localPath || !fs.existsSync(localPath)) {
+    return res.status(400).json({ success: false, error: 'Valid uploaded video localPath is required.' });
+  }
+
+  // Single-render-at-a-time guard: FFmpeg renders are CPU/RAM heavy. Report a
+  // conflict instead of launching a second one that would OOM the container.
+  const existing = activeRenderJobId ? renderJobs.get(activeRenderJobId) : null;
+  if (existing && existing.status === 'running') {
+    return res.status(409).json({
+      success: false,
+      busy: true,
+      jobId: existing.jobId,
+      error: 'A render is already in progress on this server.',
+    });
+  }
+
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const job: RenderJob = {
+    jobId,
+    status: 'running',
+    percent: 0,
+    stage: 'Initializing real FFmpeg render engine...',
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  renderJobs.set(jobId, job);
+  activeRenderJobId = jobId;
+  writeRenderState(job);
+  currentRenderProgress = { percent: 0, stage: job.stage };
+
+  const multiplier = Number(rifeMultiplier || process.env.RIFE_FPS_MULTIPLIER || 2);
+  // Fire-and-forget: the heavy work continues after this response is sent.
+  void runFullRenderJob(jobId, { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier: multiplier });
+
+  return res.status(202).json({
+    success: true,
+    jobId,
+    status: 'running',
+    // Legacy clients that expect a synchronous result can detect the async
+    // contract via `async: true` and start polling /api/render-progress.
+    async: true,
+    message: 'Render started. Poll /api/render-progress until status is done, then read /api/render-result.',
+  });
 });
 
-// 7. GET /api/render-progress
+// 7. GET /api/render-progress — live progress for the active/most-recent job.
 app.get('/api/render-progress', (req, res) => {
-  res.json(currentRenderProgress);
+  const job = readRenderJob(typeof req.query.jobId === 'string' ? req.query.jobId : undefined);
+  if (!job) {
+    return res.json({ ...currentRenderProgress, status: 'idle' });
+  }
+  res.json({
+    percent: job.percent,
+    stage: job.stage,
+    status: job.status,
+    jobId: job.jobId,
+    error: job.status === 'error' ? job.error : undefined,
+  });
+});
+
+// 7.1 GET /api/render-result — final artifact once the job is done.
+app.get('/api/render-result', (req, res) => {
+  const jobId = typeof req.query.jobId === 'string' ? req.query.jobId : undefined;
+  const job = readRenderJob(jobId);
+  if (!job) return res.status(404).json({ success: false, status: 'idle', error: 'No render job found.' });
+  if (job.status === 'running') {
+    return res.status(202).json({ success: false, status: 'running', percent: job.percent, stage: job.stage, jobId: job.jobId });
+  }
+  if (job.status === 'error') {
+    return res.status(500).json({ success: false, status: 'error', error: job.error || 'Render failed.', jobId: job.jobId });
+  }
+  return res.json(job.result || { success: true, jobId: job.jobId });
 });
 
 

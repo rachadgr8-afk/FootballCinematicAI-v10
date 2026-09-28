@@ -38,6 +38,7 @@ import {
 } from './types/football';
 
 import { API_BASE_URL, safeFetchJson, uploadVideo, getApiUrl, resolveMediaUrl } from './config/api';
+import { runCinematicRender } from './services/renderJob';
 import { AndroidPhoneFrame } from './components/AndroidPhoneFrame';
 import { AndroidMedia3Player } from './components/AndroidMedia3Player';
 import { TimelineEditor } from './components/TimelineEditor';
@@ -104,25 +105,6 @@ export default function App() {
         console.error('Failed to load presets from backend:', err);
       });
   }, []);
-
-  // Poll render progress during full cinematic rendering
-  useEffect(() => {
-    let interval: any = null;
-    if (isRenderingFull) {
-      interval = setInterval(() => {
-        safeFetchJson('/api/render-progress')
-          .then((data) => {
-            if (data && typeof data.percent === 'number') {
-              setRenderProgress(data);
-            }
-          })
-          .catch(() => {});
-      }, 700);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [isRenderingFull]);
 
   // Handle custom video upload to backend server
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -316,25 +298,18 @@ export default function App() {
       // 2. Real FFmpeg Video Processing
       setRenderProgress({ percent: 15, stage: 'Calling FFmpeg rendering engine...' });
 
-      const renderData = await safeFetchJson<{
-        success: boolean;
-        videoUrl: string;
-        posterUrl?: string;
-        duration: number;
-        fileSize: number;
-        localPath?: string;
-        error?: string;
-      }>('/api/render-full-cinematic', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      // Async job: submits immediately, then polls. Never holds a request open
+      // for minutes (which is what produced the production "Failed to fetch").
+      const renderData = await runCinematicRender(
+        {
           localPath: selectedVideo.localPath,
           editPlan: activePlan,
           generationTier,
           musicVolume: 0.24,
           originalVolume: 0.72,
-        }),
-      });
+        },
+        (p) => setRenderProgress({ percent: p.percent, stage: p.stage })
+      );
 
       if (!renderData.success) {
         throw new Error(renderData.error || 'FFmpeg rendering failed');
@@ -376,17 +351,18 @@ export default function App() {
             activePlan = revisedPlan;
             setEditPlan(revisedPlan);
             setRenderProgress({ percent: 92, stage: 'Local QC found pacing issues — applying one automatic polish pass...' });
-            const polishData = await safeFetchJson<any>('/api/render-full-cinematic', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
+            // Same async contract as the primary render: a second full montage
+            // can take minutes, so it must NOT block a single HTTP request either.
+            const polishData = await runCinematicRender(
+              {
                 localPath: selectedVideo.localPath,
                 editPlan: activePlan,
                 generationTier,
                 musicVolume: 0.24,
                 originalVolume: 0.72,
-              }),
-            });
+              },
+              (p) => setRenderProgress({ percent: p.percent, stage: p.stage })
+            );
             if (polishData.success) {
               renderData.videoUrl = polishData.videoUrl;
               renderData.posterUrl = polishData.posterUrl;
