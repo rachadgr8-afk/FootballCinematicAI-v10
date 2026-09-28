@@ -82,6 +82,10 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/public ./public
 COPY yolo ./yolo
 COPY models ./models
+# Standalone OpenCV+NumPy cinematic engine (class CinematicEngine) used by the
+# OPTIONAL server/cinematicEngine.ts bridge. Copied to the app root so the
+# bundled server.js can spawn `python3 video_engine.py`.
+COPY video_engine.py ./video_engine.py
 
 # Writable working + output directories.
 #

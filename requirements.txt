@@ -12,6 +12,12 @@ ultralytics>=8.3.0
 # wheels are built against numpy>=2, while torch 2.6+cpu resolves numpy<2. A
 # mismatch makes `import cv2` fail at runtime, which would silently force the
 # local analysis into fallback mode.
+#
+# This pair ALSO satisfies the standalone `video_engine.py` (class CinematicEngine),
+# which only needs OpenCV + NumPy. Do NOT add a second/competing OpenCV wheel
+# (opencv-contrib-python*): mixing two OpenCV builds in the same venv breaks
+# `import cv2`. The fourcc `mp4v` writer and Farneback optical flow used by the
+# engine are part of the standard (non-contrib) build already pinned here.
 numpy>=1.26,<2
 opencv-python-headless==4.10.0.84
 

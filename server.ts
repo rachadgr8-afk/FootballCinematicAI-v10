@@ -10,6 +10,7 @@ import util from 'util';
 import { ffmpegEngine, FFmpegProgress } from './server/ffmpegEngine';
 import { storage } from './server/storage';
 import { geminiRotator } from './server/geminiRotator';
+import { cinematicEngine } from './server/cinematicEngine';
 
 const execPromise = util.promisify(exec);
 
@@ -330,6 +331,70 @@ app.post('/api/video-download', (req, res) => {
  * No-op now that the AI tier is source-only: it guarantees every clip is
  * rendered from the real uploaded footage and strips any stale Veo paths.
  */
+// ---------------------------------------------------------------------------
+// CINEMATIC ENGINE (OpenCV + NumPy) — OPTIONAL, per-clip pre-processing.
+//
+// This reuses the SAME per-clip override seam the renderer already understands
+// (`clip.veo_local_path` => the renderer reads from this file instead of the
+// source). No new render system is introduced and no route is added.
+//
+// DEFAULT BEHAVIOUR IS UNCHANGED: everything here is inert unless
+// CINEMATIC_ENGINE_ENABLED=true. On any failure the clip keeps its original
+// source (applied:false) so the existing pipeline is never broken.
+//
+// A clip is a smart-slow-motion candidate only when the edit plan already marks
+// a genuinely slow shot (speed < 0.9). We then render THAT single clip through
+// CinematicEngine.slow_motion_optical_flow, so only the intended moments are
+// slowed — never the whole video.
+// ---------------------------------------------------------------------------
+async function applyCinematicEnginePrePass(
+  inputPath: string,
+  editPlan: any,
+  onProgress?: (progress: FFmpegProgress) => void
+): Promise<{ generatedPaths: string[]; processed: number }> {
+  const timeline = Array.isArray(editPlan?.timeline) ? editPlan.timeline : [];
+  const generatedPaths: string[] = [];
+  if (!editPlan || !timeline.length) return { generatedPaths, processed: 0 };
+
+  const engineTempDir = path.resolve(process.env.TMP_WORK_DIR || '/tmp/football_engine/work', 'cinematic_engine');
+  try { fs.mkdirSync(engineTempDir, { recursive: true }); } catch {}
+
+  let processed = 0;
+  for (let i = 0; i < timeline.length; i++) {
+    const clip = timeline[i];
+    // Skip clips that already carry an override (e.g. an AI insert).
+    if (typeof clip.veo_local_path === 'string' && fs.existsSync(clip.veo_local_path)) continue;
+
+    const sourceStart = Math.max(0, Number(clip.source_start) || 0);
+    const sourceEnd = Math.max(sourceStart + 0.08, Number(clip.source_end) || sourceStart + 1);
+    const span = sourceEnd - sourceStart;
+    const speed = Number(clip.speed) || 1;
+    const isSlow = clip.beat_role === 'climax' || speed < 0.9;
+    // Guard: only apply to short, genuinely-slow windows (cost + RAM safety).
+    if (!isSlow || span <= 0.1 || span > 6.0) continue;
+
+    const outPath = path.join(engineTempDir, `slow_${Date.now()}_${i}.mp4`);
+    const slowFactor = Math.max(0.25, Math.min(1.0, speed));
+    const res = await cinematicEngine.slowMotion(inputPath, outPath, slowFactor, sourceStart, sourceEnd);
+    if (res.applied && res.outputPath) {
+      clip.veo_local_path = res.outputPath;
+      clip.veo_status = 'fallback';
+      // The renderer fits a real [source_start, source_end] window into the
+      // output slot; with the slowed file the source window immediately follows
+      // the slowed playback start.
+      clip.source_start = 0;
+      clip.source_end = span * (1 / slowFactor);
+      generatedPaths.push(res.outputPath);
+      processed += 1;
+      onProgress?.({
+        percent: 6 + Math.floor((i / timeline.length) * 20),
+        stage: `Cinematic engine: smart slow-motion on shot ${i + 1}/${timeline.length}...`,
+      });
+    }
+  }
+  return { generatedPaths, processed };
+}
+
 async function prepareVeoEnhancements(inputPath: string, editPlan: any, _generationTier: string, _onProgress?: (progress: FFmpegProgress) => void) {
   const timeline = Array.isArray(editPlan?.timeline) ? editPlan.timeline : [];
   for (const clip of timeline) {
@@ -337,6 +402,18 @@ async function prepareVeoEnhancements(inputPath: string, editPlan: any, _generat
     clip.veo_status = 'not_requested';
     if (clip.veo_local_path) delete clip.veo_local_path;
   }
+
+  // OPTIONAL cinematic-engine pre-pass (opt-in; inert by default). Failures are
+  // swallowed and leave the plan exactly as-is. Any generated files are recorded
+  // on clip.veo_local_path, so the renderer's existing cleanup handles them.
+  if (cinematicEngine.enabled) {
+    try {
+      await applyCinematicEnginePrePass(inputPath, editPlan, _onProgress);
+    } catch (err: any) {
+      console.warn('[CinematicEngine] pre-pass skipped:', err?.message || err);
+    }
+  }
+
   return editPlan;
 }
 
@@ -865,6 +942,8 @@ async function runFullRenderJob(
   let generatedVeoPaths: string[] = [];
   try {
     const preparedPlan = await prepareVeoEnhancements(localPath, editPlan, generationTier, (p) => updateJob(job, { percent: p.percent, stage: p.stage }));
+    // NOTE: engine-generated slow-motion files are registered as clip.veo_local_path
+    // by the pre-pass, so this list already covers them (cleaned up in finally).
     generatedVeoPaths = preparedPlan.timeline.map((c: any) => c.veo_local_path).filter((p: any) => typeof p === 'string');
 
     const result = await ffmpegEngine.renderFullCinematic(

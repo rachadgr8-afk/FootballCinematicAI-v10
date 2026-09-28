@@ -34,7 +34,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements-cpu.txt
           python3 scripts/verify_cpu_torch.py
-          python3 -m py_compile main.py yolo/*.py tests/*.py
+          python3 -m py_compile main.py video_engine.py yolo/*.py tests/*.py
 
       - name: Guard server route + key-rotation contracts
         run: |
