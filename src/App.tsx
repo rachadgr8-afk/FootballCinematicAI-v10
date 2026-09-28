@@ -33,6 +33,8 @@ import {
   PipelineStage,
   EditPlan,
   FootballVideoMetadata,
+  CinematicMode,
+  ReferenceStyleProfile,
   QCReview,
   StyleProfile,
 } from './types/football';
@@ -55,6 +57,11 @@ export default function App() {
   const [selectedStyle, setSelectedStyle] = useState<AIStyle>('REFERENCE CINEMATIC REEL');
   const [generationTier, setGenerationTier] = useState<GenerationTier>('AI CINEMATIC');
   const [referenceProfile, setReferenceProfile] = useState<StyleProfile | null>(null);
+  // CINEMATIC MODE: STANDARD | PRO | REFERENCE. REFERENCE mode consumes the
+  // MEASURED profile of a reference video (style parameters only).
+  const [cinematicMode, setCinematicMode] = useState<CinematicMode>('STANDARD');
+  const [referenceStyleProfile, setReferenceStyleProfile] = useState<ReferenceStyleProfile | null>(null);
+  const [referenceLocalPath, setReferenceLocalPath] = useState<string | null>(null);
 
   // Active Video URL in Player
   const [activePlayerUrl, setActivePlayerUrl] = useState<string>(resolveMediaUrl('/videos/football_match.mp4'));
@@ -284,6 +291,9 @@ export default function App() {
           style: styleToUse,
           generationTier,
           referenceStyle: referenceProfile,
+          referenceStyleProfile,
+          referenceLocalPath,
+          cinematicMode,
           trackingEnabled: true,
         }),
       });
@@ -719,6 +729,37 @@ export default function App() {
               </p>
             </div>
 
+            {/* CINEMATIC MODE — drives the Cinematic Director */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col gap-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">Cinematic Mode</span>
+                <span className="text-[10px] text-purple-300">Director v11 — player-first, event-driven</span>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  { id: 'STANDARD', label: 'Standard', hint: 'Safe pacing' },
+                  { id: 'PRO', label: 'Pro', hint: 'Stronger dynamics' },
+                  { id: 'REFERENCE', label: 'Reference', hint: 'Measured style' },
+                ] as { id: CinematicMode; label: string; hint: string }[]).map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => setCinematicMode(m.id)}
+                    className={`p-2 rounded-xl border text-[10px] font-black transition ${cinematicMode === m.id
+                      ? 'bg-purple-950/70 border-purple-400 text-purple-200'
+                      : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-white'}`}
+                  >
+                    <span className="block">{m.label}</span>
+                    <span className="block text-[9px] font-semibold opacity-70">{m.hint}</span>
+                  </button>
+                ))}
+              </div>
+              <p className="text-[10px] text-slate-400">
+                {cinematicMode === 'REFERENCE'
+                  ? 'REFERENCE mode uses the measured style parameters of your reference video (pacing, cut density, zoom, speed, text, transitions, colour). It never copies its timestamps or shot order.'
+                  : 'The director selects real player/ball-tracked moments, applies eased dynamic reframing, event-driven speed ramps, one cinematic grade and a hard-cut rhythm.'}
+              </p>
+            </div>
+
             {/* MASTER RENDER ACTION */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col gap-3">
               <div className="flex items-center justify-between">
@@ -853,7 +894,12 @@ export default function App() {
       {showRefModal && (
         <ReferenceStyleModal
           currentProfile={referenceProfile}
-          onApplyProfile={(profile) => setReferenceProfile(profile)}
+          onApplyProfile={(profile, measured, localPath) => {
+            setReferenceProfile(profile);
+            if (measured) setReferenceStyleProfile(measured);
+            if (localPath) setReferenceLocalPath(localPath);
+            if (measured) setCinematicMode('REFERENCE');
+          }}
           onClose={() => setShowRefModal(false)}
         />
       )}

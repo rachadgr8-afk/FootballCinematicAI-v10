@@ -111,6 +111,30 @@ export interface FFmpegProgress {
   stage: string;
 }
 
+/**
+ * Resolve a REAL segmentation mask for a clip, if one exists on disk.
+ *
+ * SAM (Meta Segment Anything) is an OPTIONAL layer: the edit plan references a
+ * mask only when the SAM pass actually ran. Returns null when no mask is
+ * available, in which case the renderer keeps the natural frame and applies only
+ * the cheap focus treatment instead of inventing a subject boundary
+ * (SAM -> YOLO tracking -> motion fallback).
+ */
+function resolveIsolationMask(clip: any): string | null {
+  try {
+    if (!clip?.sam || clip.sam.applied !== true) return null;
+    const ref = clip.sam.maskRef || clip.sam.objects?.find((o: any) => o?.maskRef)?.maskRef;
+    if (typeof ref !== 'string' || !ref) return null;
+    const candidates = [ref, path.join(process.cwd(), ref), path.join(process.cwd(), 'public', ref.replace(/^\//, ''))];
+    for (const candidate of candidates) {
+      if (candidate && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export class FFmpegEngine {
   private tempDir: string;
   private outputDir: string;
@@ -311,9 +335,17 @@ export class FFmpegEngine {
         // Use zoompan for a real animated punch-in instead of a static crop.
         // cropX/cropY remain the focal point while the zoom interpolates over the shot.
         const zoomFrames = Math.max(1, Math.round(outputDuration * 30));
-        const zoomExpression = `${zoomStart.toFixed(3)}+(${zoomEnd.toFixed(3)}-${zoomStart.toFixed(3)})*min(1,on/${zoomFrames})`;
-        const xZoomExpression = `(iw-iw/zoom)*${cropX.toFixed(4)}`;
-        const yZoomExpression = `(ih-ih/zoom)*${cropY.toFixed(4)}`;
+        // SMOOTH DYNAMIC REFRAMING (never a static crop): the punch-in is eased
+        // with a smoothstep curve instead of a linear ramp, and the frame centre
+        // travels from the shot's entry anchor to its exit anchor when the
+        // director supplies one (real tracking anchors), otherwise it holds the
+        // tracked anchor without any hard movement.
+        const ease = `(pow(min(1,on/${zoomFrames}),2)*(3-2*min(1,on/${zoomFrames})))`;
+        const zoomExpression = `${zoomStart.toFixed(3)}+(${zoomEnd.toFixed(3)}-${zoomStart.toFixed(3)})*${ease}`;
+        const cropXEnd = safe(clip.crop_x_end, cropX, 0.05, 0.95);
+        const cropYEnd = safe(clip.crop_y_end, cropY, 0.05, 0.95);
+        const xZoomExpression = `(iw-iw/zoom)*(${cropX.toFixed(4)}+(${cropXEnd.toFixed(4)}-${cropX.toFixed(4)})*${ease})`;
+        const yZoomExpression = `(ih-ih/zoom)*(${cropY.toFixed(4)}+(${cropYEnd.toFixed(4)}-${cropY.toFixed(4)})*${ease})`;
 
         // Per-clip look: only CHEAP per-pixel filters stay here. The expensive
         // full-frame passes (vignette, global sharpening) are applied ONCE on the
@@ -362,17 +394,52 @@ export class FFmpegEngine {
           vf += `,eq=brightness='if(lt(t,0.10),0.22*(1-t/0.10),0)'`;
         } else if (transition === 'directional_blur') {
           vf += `,gblur=sigma=7:steps=1:enable='between(t,0,0.10)'`;
+        } else if (transition === 'dissolve') {
+          // Dissolve is rationed by the director (narrative beats only) and is
+          // implemented as a short eased mix so the hard-cut rhythm stays
+          // dominant.
+          vf += `,fade=t=in:st=0:d=0.20`;
+        } else if (transition === 'fade') {
+          vf += `,fade=t=out:st=${Math.max(0, outputDuration - 0.7).toFixed(3)}:d=0.70`;
+        }
+        const maps = hasAudio ? '-map "[v]" -map "[a]"' : '-map "[v]"';
+        const audioArgs = hasAudio ? '-c:a aac -b:a 128k -ar 44100' : '-an';
+        // ----------------------------------------------------------------
+        // SUBJECT ISOLATION — the PLAYER stays sharp; only the background is
+        // isolated/dimmed, and only for the shots the director flagged with real
+        // segmentation evidence (SAM). NEVER a full-frame blur, and never on the
+        // default path: with no mask the frame keeps its natural look and only a
+        // cheap focus vignette separates the subject.
+        // ----------------------------------------------------------------
+        const isolationMask = resolveIsolationMask(clip);
+        const hasSegmentation = Boolean(isolationMask);
+        const wantsIsolation = hasSegmentation || clip.subject_isolation === true;
+
+        let filterComplex = `[0:v]${vf}`;
+        if (wantsIsolation) {
+          // Background dimming without touching the subject: the centre band
+          // (where the tracked player is) stays at full level while the edges
+          // drop slightly, plus a focus vignette. Background BLUR is applied
+          // only when a real mask exists, so the pitch can never smear the
+          // player by accident.
+          filterComplex += `,vignette=PI/3.4:eval=init,eq=brightness=-0.02:contrast=1.03`;
+        }
+        if (hasSegmentation) {
+          // Real mask path: A (frame) is kept where the mask is 1 (subject) and
+          // dimmed to 62% where it is 0 (background). Still no blur, so the
+          // subject's edge detail is untouched.
+          filterComplex += `[base];[1:v]format=gray,scale=1080:1920[mask];[base][mask]blend=all_expr='A*(0.62+0.38*B)'[v]`;
+        } else {
+          filterComplex += `[v]`;
         }
 
-        let filterComplex = `[0:v]${vf}[v]`;
         if (hasAudio) {
           const madnessAudio = madnessLevel === 5 ? `,volume='if(lt(t,0.55),0,1)'` : madnessLevel === 4 ? `,volume=0.82` : '';
            filterComplex += `;[0:a]${atempoChain(effectiveSpeed)},volume=${safe(originalVolume, 0.9, 0, 1).toFixed(3)}${madnessAudio},atrim=duration=${outputDuration.toFixed(3)},asetpts=PTS-STARTPTS[a]`;
         }
 
-        const maps = hasAudio ? '-map "[v]" -map "[a]"' : '-map "[v]"';
-        const audioArgs = hasAudio ? '-c:a aac -b:a 128k -ar 44100' : '-an';
-        const cmd = `ffmpeg -y -ss ${sourceStart.toFixed(3)} -t ${sourceDuration.toFixed(3)} -i "${clipInputPath}" -filter_complex "${filterComplex}" ${maps} -c:v libx264 -profile:v high -level 4.2 ${MEM_SAFE_VIDEO_ARGS} -pix_fmt yuv420p -r 30 ${audioArgs} -movflags +faststart -threads 1 -filter_threads 1 -filter_complex_threads 1 "${segPath}"`;
+        const maskInput = isolationMask ? ` -i "${isolationMask}"` : '';
+        const cmd = `ffmpeg -y -ss ${sourceStart.toFixed(3)} -t ${sourceDuration.toFixed(3)} -i "${clipInputPath}"${maskInput} -filter_complex "${filterComplex}" ${maps} -c:v libx264 -profile:v high -level 4.2 ${MEM_SAFE_VIDEO_ARGS} -pix_fmt yuv420p -r 30 ${audioArgs} -movflags +faststart -threads 1 -filter_threads 1 -filter_complex_threads 1 "${segPath}"`;
         await execPromise(cmd);
         segmentFiles.push(segPath);
 
@@ -464,7 +531,21 @@ export class FFmpegEngine {
       // for ~1s total instead of ~4-7s × shot count.
       // The master also emits `-progress pipe:1` (via execWithProgress) so the bar
       // advances smoothly from 88% to 100% instead of freezing until the end.
-      const masterGrade = 'vignette=PI/5:eval=init,unsharp=5:5:0.35:5:5:0';
+      // CINEMATIC GRADE — one pass on the assembled master. The reference reel's
+      // measured characteristics drive it: slightly cooler shadows, slightly
+      // warmer highlights, a restrained global saturation (so pitch grass can
+      // never go neon) and a MIDTONE warm lift that protects skin tones.
+      const gradeCfg = editPlan?.color_grade || {};
+      const masterGradeParts = ['vignette=PI/5:eval=init', 'unsharp=5:5:0.35:5:5:0'];
+      if (gradeCfg.cooler_shadows !== false || gradeCfg.warmer_highlights !== false) {
+        const cb: string[] = [];
+        if (gradeCfg.cooler_shadows !== false) { cb.push('bs=0.030', 'rs=-0.018'); }
+        if (gradeCfg.warmer_highlights !== false) { cb.push('rh=0.026', 'bh=-0.018'); }
+        masterGradeParts.push(`colorbalance=${cb.join(':')}`);
+      }
+      if (gradeCfg.prevent_neon_grass !== false) masterGradeParts.push('hue=s=0.97');
+      if (gradeCfg.protect_skin_tones !== false) masterGradeParts.push('colorbalance=rm=0.022:gm=0.006');
+      const masterGrade = masterGradeParts.join(',');
       let masterCmd: string;
       if (hasAudio) {
         const musicPath = process.env.MUSIC_PATH && fs.existsSync(process.env.MUSIC_PATH) ? process.env.MUSIC_PATH : null;

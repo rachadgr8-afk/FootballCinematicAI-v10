@@ -12,6 +12,7 @@ import { storage } from './server/storage';
 import { geminiRotator } from './server/geminiRotator';
 import { cinematicEngine } from './server/cinematicEngine';
 import { samService } from './server/samService';
+import { referenceStyleService, CinematicMode } from './server/referenceStyleService';
 
 const execPromise = util.promisify(exec);
 
@@ -475,6 +476,28 @@ async function applySamPrePass(
 
 // Live render progress tracking
 let currentRenderProgress: FFmpegProgress = { percent: 0, stage: 'Idle' };
+
+/**
+ * Map a measured ReferenceStyleProfile onto the EXISTING StyleProfile contract.
+ * The full measured profile travels alongside it as `referenceStyleProfile`, so
+ * the editor can use either shape without breaking legacy clients.
+ */
+function toLegacyStyleProfile(profile: any): any {
+  const color = profile?.color || {};
+  const trans = profile?.transition_weights || {};
+  const avg = Number(profile?.avg_shot_duration) || 2.9;
+  return {
+    average_shot_duration: avg,
+    zoom_intensity: Math.max(0, Math.min(1, (Number(profile?.zoom_intensity) || 0.014) / 0.03)),
+    transition_frequency: Number(trans?.hard_cut ?? 0.9),
+    slow_motion_frequency: Number(profile?.slow_motion_shot_ratio) || 0.15,
+    text_frequency: Number(profile?.text_per_shot) || 0.1,
+    color_style: `measured: contrast ${color?.contrast ?? 0}, saturation ${color?.saturation ?? 0}, skin ${color?.skin_ratio ?? 0}, neon-grass ${color?.neon_grass_ratio ?? 0}`,
+    energy_curve: 'hook / setup / escalation / impact / reaction / climax / outro (measured cut density + audio impact sync)',
+    recommended_bpm: Math.max(90, Math.min(150, Math.round((60 / Math.max(0.5, avg)) * 2))),
+    cinematography_notes: `Measured from ${profile?.duration ?? 0}s / ${profile?.shot_count ?? 0} shots: cut density ${profile?.cut_density ?? 0}/s, subject-shot ratio ${profile?.subject_shot_ratio ?? 0}, hard-cut ratio ${trans?.hard_cut ?? 0}, cut-impact sync ${profile?.audio?.cut_impact_sync_ratio ?? 0}.`,
+  };
+}
 
 // Real local football video presets for instant testability
 const SAMPLE_FOOTBALL_CLIPS = [
@@ -1458,7 +1481,17 @@ async function runMadnessEngine(eventsPath: string, timeline: any[]) {
 // used, so this route can never fail because of a Gemini/Veo outage.
 app.post('/api/analyze-video', async (req, res) => {
   try {
-    const { videoMetadata, style = 'CINEMATIC SPORTS', generationTier = 'ORIGINAL FOOTAGE ONLY', trackingEnabled = true } = req.body;
+    const {
+      videoMetadata,
+      style = 'CINEMATIC SPORTS',
+      generationTier = 'ORIGINAL FOOTAGE ONLY',
+      trackingEnabled = true,
+      // Cinematic Mode: STANDARD | PRO | REFERENCE. Defaults to STANDARD so the
+      // existing behaviour is preserved for every legacy client.
+      cinematicMode = 'STANDARD',
+      referenceStyle = null,
+      referenceLocalPath = null,
+    } = req.body;
     const localPath = videoMetadata?.localPath;
     let duration = Number(videoMetadata?.duration);
     if (!localPath || !fs.existsSync(localPath)) {
@@ -1497,10 +1530,64 @@ app.post('/api/analyze-video', async (req, res) => {
     }
     const footballEvidence = trackingResult ? await runFootballEvidence(localPath, trackingResult) : null;
 
-    // 3) Build a real, source-grounded edit plan from the measured motion.
-    const parsed = buildLocalEditPlan(duration, motion, style);
+    // 3) Edit Plan V2 via the Cinematic Director.
+    //
+    // The director is STYLE-DRIVEN (STANDARD / PRO / the measured reference
+    // profile) and EVENT-DRIVEN (real motion + real YOLO tracking/events). It
+    // never copies the reference video's timestamps, shot order or frames.
+    //
+    // FAIL-SAFE: if the director is unavailable, rejects its own validation, or
+    // returns nothing usable, the existing buildLocalEditPlan() result is kept
+    // untouched, so the render contract and behaviour never regress.
+    const resolvedMode = (['STANDARD', 'PRO', 'REFERENCE'].includes(String(cinematicMode).toUpperCase())
+      ? String(cinematicMode).toUpperCase()
+      : 'STANDARD') as CinematicMode;
+
+    // Accept BOTH profile shapes: the measured ReferenceStyleProfile from
+    // /api/reference-style/analyze, and the legacy StyleProfile contract.
+    let normalizedReference: any = null;
+    if (referenceStyle && typeof referenceStyle === 'object') {
+      normalizedReference = referenceStyle.avg_shot_duration !== undefined
+        ? referenceStyle
+        : {
+            source: 'client-style-profile',
+            avg_shot_duration: Number(referenceStyle.average_shot_duration) || 2.9,
+            cut_density: referenceStyle.average_shot_duration ? 1 / Number(referenceStyle.average_shot_duration) : 0.34,
+            zoom_intensity: Number(referenceStyle.zoom_intensity) || 0.014,
+            slow_motion_shot_ratio: Number(referenceStyle.slow_motion_frequency) || 0.15,
+            text_per_shot: Number(referenceStyle.text_frequency) || 0.1,
+            transition_weights: { hard_cut: Number(referenceStyle.transition_frequency) || 0.84 },
+            shot_type_weights: { close_up: 0.6, action: 0.25, wide: 0.15 },
+            color: {},
+          };
+    }
+
+    currentRenderProgress = { percent: 14, stage: `Cinematic Director (${resolvedMode}) is building Edit Plan V2...` };
+    const director = await referenceStyleService.buildEditPlan({
+      duration,
+      motion,
+      eventsPath: (footballEvidence as any)?.eventsPath,
+      trackingPath: trackingResult?.jsonUrl
+        ? path.join(videosDir, String(trackingResult.jsonUrl).replace(/^\/videos\//, ''))
+        : undefined,
+      referenceStyle: normalizedReference,
+      referenceLocalPath: typeof referenceLocalPath === 'string' && referenceLocalPath ? referenceLocalPath : undefined,
+      mode: resolvedMode,
+      subject: videoMetadata?.defaultSubject,
+    });
+
+    const parsed = director.applied && director.plan
+      ? director.plan
+      : buildLocalEditPlan(duration, motion, style);
     parsed.generationTier = generationTier;
     parsed.styleName = style;
+    (parsed as any).cinematicMode = resolvedMode;
+    if (director.applied) {
+      (parsed as any).cinematicDirectorSource = 'cinematic-director-v11';
+    } else {
+      (parsed as any).cinematicDirectorSource = 'local-motion-fallback';
+      (parsed as any).cinematicDirectorMessage = director.message || 'director unavailable';
+    }
 
     currentRenderProgress = { percent: 22, stage: 'Validating the 64-second edit plan...' };
     // validateAndEnforce64sEditPlan re-normalises timing/captions WITHOUT touching
@@ -1527,8 +1614,18 @@ app.post('/api/analyze-video', async (req, res) => {
       editPlan: validatedPlan,
       fallbackUsed: false,
       videoAnalyzed: true,
-      analysisMode: 'local-motion',
+      analysisMode: director.applied ? 'cinematic-director-v11' : 'local-motion',
       model: motion.model || 'local-opencv-motion',
+      cinematicMode: resolvedMode,
+      cinematicDirector: {
+        applied: director.applied,
+        source: (parsed as any).cinematicDirectorSource,
+        clips: director.clips || 0,
+        heroMoment: director.heroMoment || null,
+        evidenceLevel: director.evidenceLevel || null,
+        referenceStyleSource: normalizedReference?.source || null,
+        message: director.message || null,
+      },
       motion: {
         samples: motion.motion_profile.length,
         slowMoments: motion.slow_moments.length,
@@ -1639,8 +1736,77 @@ app.post('/api/qc-review', async (req, res) => {
 // The reference reel is a STYLE preset, not a downloaded/copied video: we return
 // a deterministic editorial profile so the editor applies the same rhythm without
 // any external model call.
-app.post('/api/analyze-reference', async (req, res) => {
+// ---------------------------------------------------------------------------
+// REFERENCE STYLE + CINEMATIC DIRECTOR routes.
+//
+// The reference video is measured ONCE into a ReferenceStyleProfile (style
+// parameters only: pacing, cut density, zoom intensity, speed handling, framing
+// mix, typography, transitions, colour, audio and hero-shot structure). The
+// profile then drives the Cinematic Director. No timestamps, shot order, frames,
+// logos or watermarks from the reference are ever imported into the output.
+//
+// `/api/analyze-reference` keeps its exact legacy response contract (it is
+// still callable with just a title) and now upgrades to a REAL local analysis
+// when a reference file is supplied.
+// ---------------------------------------------------------------------------
+app.post('/api/reference-style/analyze', uploadMiddleware, async (req: any, res: any) => {
+  try {
+    const files = Array.isArray(req.files) ? req.files : [];
+    const uploaded = files.find((f: any) => /video|mp4|quicktime|matroska|mpeg/.test(String(f?.mimetype || ''))) || files[0];
+    const localPath =
+      uploaded?.path ||
+      (typeof req.body?.localPath === 'string' && req.body.localPath ? req.body.localPath : undefined) ||
+      (typeof req.body?.referenceLocalPath === 'string' ? req.body.referenceLocalPath : undefined);
+
+    if (!localPath || !fs.existsSync(String(localPath))) {
+      return res.status(400).json({
+        success: false,
+        error: 'A reference video file (or a valid server-side localPath) is required.',
+      });
+    }
+
+    currentRenderProgress = { percent: 4, stage: 'Measuring the reference video style...' };
+    const profile = await referenceStyleService.analyseReference(String(localPath));
+    if (!profile) {
+      return res.status(503).json({
+        success: false,
+        error: 'Reference style analysis is unavailable (disabled or unreadable reference file).',
+      });
+    }
+    return res.json({
+      success: true,
+      analysisMode: 'measured-local',
+      referenceLocalPath: String(localPath),
+      styleProfile: toLegacyStyleProfile(profile),
+      referenceStyleProfile: profile,
+    });
+  } catch (err: any) {
+    console.error('[REFERENCE STYLE] analysis failed:', err?.message || err);
+    return res.status(500).json({ success: false, error: err?.message || 'Reference style analysis failed.' });
+  }
+});
+
+app.post('/api/analyze-reference', uploadMiddleware, async (req: any, res: any) => {
   const { referenceTitle } = req.body || {};
+  const files = Array.isArray(req.files) ? req.files : [];
+  const uploaded = files.find((f: any) => /video|mp4|quicktime|matroska|mpeg/.test(String(f?.mimetype || ''))) || files[0];
+  const localPath = uploaded?.path || (typeof req.body?.localPath === 'string' && req.body.localPath ? req.body.localPath : undefined);
+
+  // Real, measured analysis when a reference file is available. Never throws.
+  if (localPath && fs.existsSync(String(localPath))) {
+    const profile = await referenceStyleService.analyseReference(String(localPath));
+    if (profile) {
+      return res.json({
+        success: true,
+        analysisMode: 'measured-local',
+        referenceLocalPath: String(localPath),
+        styleProfile: toLegacyStyleProfile(profile),
+        referenceStyleProfile: profile,
+      });
+    }
+  }
+
+  // Legacy deterministic profile (unchanged contract for title-only callers).
   res.json({
     success: true,
     analysisMode: 'local',
@@ -1656,6 +1822,29 @@ app.post('/api/analyze-reference', async (req, res) => {
       cinematography_notes: `Tight 9:16 crops, close-ups, football details, restrained flash impacts, small white editorial captions, hard-cut rhythm. (profile: ${String(referenceTitle || 'Reference Cinematic Football Reel').slice(0, 80)})`,
     },
   });
+});
+
+// Direct Cinematic Director endpoint: build an Edit Plan V2 without a render.
+app.post('/api/cinematic-director/plan', async (req, res) => {
+  try {
+    const { duration, motion = null, trackingPath = null, eventsPath = null, referenceStyle = null, mode = 'STANDARD', subject = 'Main player' } = req.body || {};
+    const dur = Number(duration);
+    if (!Number.isFinite(dur) || dur < 1) {
+      return res.status(400).json({ success: false, error: 'A valid source duration (seconds) is required.' });
+    }
+    const result = await referenceStyleService.buildEditPlan({
+      duration: dur,
+      motion,
+      trackingPath: typeof trackingPath === 'string' ? trackingPath : undefined,
+      eventsPath: typeof eventsPath === 'string' ? eventsPath : undefined,
+      referenceStyle,
+      mode,
+      subject,
+    });
+    return res.json({ success: result.applied, ...result });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Cinematic Director failed.' });
+  }
 });
 
 

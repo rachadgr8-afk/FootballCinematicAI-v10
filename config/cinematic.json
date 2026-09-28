@@ -1,0 +1,73 @@
+{
+  "version": "cinematic-director-v11",
+  "description": "Cinematic Mode + Reference Style driving the Cinematic Director. Style parameters only: the reference reel never supplies timestamps, shot order, frames, logos or watermarks to the output.",
+  "modes": {
+    "STANDARD": {
+      "avg_shot_duration": 4.0,
+      "cut_density": 0.25,
+      "zoom_intensity": 0.01,
+      "slow_motion_shot_ratio": 0.12,
+      "text_per_shot": 0.25,
+      "subject_bias": 0.6
+    },
+    "PRO": {
+      "avg_shot_duration": 3.2,
+      "cut_density": 0.31,
+      "zoom_intensity": 0.016,
+      "slow_motion_shot_ratio": 0.22,
+      "text_per_shot": 0.2,
+      "subject_bias": 0.72
+    },
+    "REFERENCE": {
+      "driven_by": "ReferenceStyleProfile",
+      "note": "All pacing/zoom/slow-motion/text parameters are replaced by the measured values of the analysed reference video."
+    }
+  },
+  "quality_rules": {
+    "player_is_the_subject": true,
+    "use_real_tracking_when_available": true,
+    "no_static_crop_or_zoom": true,
+    "smooth_dynamic_reframing_with_easing": true,
+    "never_full_frame_blur_as_default": true,
+    "isolation_order": ["SAM", "YOLO", "MOTION"],
+    "slow_motion_must_be_event_driven": true,
+    "hero_moment_gets_best_framing_speed_grade_sound": true,
+    "cuts_follow_action_not_even_splits": true,
+    "minimal_meaningful_text": true,
+    "forbid_generic_template_phrases_without_evidence": ["WATCH THIS"],
+    "hard_cut_default_transition": true,
+    "dissolve_only_when_it_serves_the_narrative": true,
+    "protect_skin_tones": true,
+    "prevent_neon_grass": true,
+    "cooler_shadows_warmer_highlights_controlled": true,
+    "intentional_ending": ["hero", "reaction", "celebration", "outro"],
+    "never_invent_goal_celebration_or_player_event": true
+  },
+  "output_contract": {
+    "duration_seconds": 64,
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "video_codec": "h264",
+    "pix_fmt": "yuv420p",
+    "audio_codec": "aac"
+  },
+  "reference_matching": {
+    "mode": "adaptive_style_parameters",
+    "never_frame_by_frame": true,
+    "extracted_parameters": [
+      "avg_shot_duration",
+      "cut_density",
+      "zoom_intensity",
+      "slow_motion_shot_ratio",
+      "text_frequency",
+      "transition_frequency",
+      "color_characteristics",
+      "hero_shot_structure",
+      "shot_type_weights",
+      "camera_movement_weights",
+      "subject_isolation_ratio",
+      "cut_impact_sync_ratio"
+    ]
+  }
+}
