@@ -46,6 +46,18 @@ def main() -> int:
     print(f"isRotatableError() -> {body.strip()}")
 
     # 2. Behavioural contract: run the real rotator against a mixed key pool.
+    #    This needs Node + node_modules (the rotator imports @google/genai), so it
+    #    is skipped — never failed — in a Python-only environment such as the
+    #    `python-quality` CI job, which installs no npm packages.
+    node_modules = ROOT / "node_modules" / "@google" / "genai"
+    if not node_modules.exists():
+        print(
+            "no node_modules/@google/genai present — behavioural harness skipped "
+            "(static contract above is still enforced)."
+        )
+        print("\nGEMINI KEY ROTATOR CONTRACT: PASS (static)")
+        return 0
+
     harness = ROOT / "_rotator_harness.ts"
     harness.write_text(
         """
