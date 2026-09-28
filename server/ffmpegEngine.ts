@@ -1,10 +1,97 @@
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import util from 'util';
 import { storage } from './storage';
 
 const execPromise = util.promisify(exec);
+
+/**
+ * Peak RSS (kB) of the direct children of `shellPid`.
+ *
+ * FFmpeg commands are launched through `/bin/sh -c` (the filter graphs contain
+ * quoting that a raw argv split would corrupt), so `child.pid` belongs to the
+ * shell — not FFmpeg. The encoder runs one level down, hence we scan /proc for
+ * processes whose PPID is the shell and take the largest VmHWM among them.
+ */
+function childrenPeakRssKb(shellPid?: number): number {
+  if (!shellPid) return 0;
+  let peak = 0;
+  try {
+    for (const entry of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const stat = fs.readFileSync(`/proc/${entry}/stat`, 'utf8');
+        const rparen = stat.lastIndexOf(')');
+        const ppid = Number(stat.slice(rparen + 2).split(' ')[1]);
+        if (ppid !== shellPid) continue;
+        const match = /VmHWM:\s+(\d+)\s+kB/.exec(fs.readFileSync(`/proc/${entry}/status`, 'utf8'));
+        if (match) peak = Math.max(peak, Number(match[1]));
+      } catch {}
+    }
+  } catch {}
+  return peak;
+}
+
+/**
+ * Run an FFmpeg command that emits machine-readable progress on stdout.
+ *
+ * FFmpeg is invoked with `-progress pipe:1 -nostats` (injected here so every
+ * caller keeps its existing argv) which suppresses the human `frame=.. time=..`
+ * stderr line and instead writes key/value blocks on stdout, one key per line,
+ * terminated by a `progress=continue|end` line. We parse those blocks and hand
+ * the running output timestamp (`out_time_us`, in seconds) to `onSeconds` so the
+ * caller can translate it into UI progress.
+ *
+ * This is a behavioural drop-in for `execPromise(cmd)`: it resolves with
+ * `{ stdout, stderr }` and rejects when FFmpeg exits non-zero. It additionally
+ * samples the child's peak RSS (`VmHWM` from /proc) so memory stays observable.
+ */
+function execWithProgress(
+  cmd: string,
+  onSeconds?: (outTimeSeconds: number) => void
+): Promise<{ stdout: string; stderr: string; peakRssKb: number }> {
+  return new Promise((resolve, reject) => {
+    // Global flags: prepend so they apply regardless of the caller's argv.
+    const argv = cmd.replace(/^ffmpeg\s/, 'ffmpeg -progress pipe:1 -nostats -hide_banner ');
+    const child = spawn('/bin/sh', ['-c', argv]);
+
+    let stdout = '';
+    let stderr = '';
+    let buffer = '';
+    let peakRssKb = 0;
+
+    // Peak RSS (VmHWM) is cheap to sample and lets us prove the memory-safe
+    // flags hold on small hosts. `child.pid` is the wrapper shell; FFmpeg runs
+    // one level down, so we sample the shell's direct children.
+    const rssTimer = setInterval(() => {
+      peakRssKb = Math.max(peakRssKb, childrenPeakRssKb(child.pid));
+    }, 250);
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
+      stdout += text;
+      buffer += text;
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        if (line.slice(0, eq).trim() === 'out_time_us' && onSeconds) {
+          const micros = Number(line.slice(eq + 1).trim());
+          if (Number.isFinite(micros)) onSeconds(micros / 1_000_000);
+        }
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('error', (err) => { clearInterval(rssTimer); reject(err); });
+    child.on('close', (code) => {
+      clearInterval(rssTimer);
+      if (code === 0) resolve({ stdout, stderr, peakRssKb });
+      else reject(new Error(`FFmpeg exited with code ${code}: ${cmd}\n${stderr.slice(-2000)}`));
+    });
+  });
+}
 
 /**
  * Memory-safe libx264 flags for low-RAM free/entry-level hosts.
@@ -166,6 +253,7 @@ export class FFmpegEngine {
     const shellQuote = (value: string) => value.replace(/\\/g, '\\\\').replace(/'/g, "'\\''");
     const atempoChain = (speed: number) => `atempo=${Math.max(0.5, Math.min(2, speed)).toFixed(4)}`;
     const safe = (n: any, fallback: number, min: number, max: number) => Math.max(min, Math.min(max, Number.isFinite(Number(n)) ? Number(n) : fallback));
+    const renderStart = Date.now();
 
     try {
       onProgress?.({ percent: 5, stage: 'Building premium reference-style montage...' });
@@ -295,11 +383,76 @@ export class FFmpegEngine {
       const concatListPath = path.join(sessionDir, 'concat_list.txt');
       fs.writeFileSync(concatListPath, segmentFiles.map((f) => `file '${shellQuote(f)}'`).join('\n'));
       const concatenatedPath = path.join(sessionDir, 'concatenated.mp4');
-      const concatAudio = hasAudio ? '-c:a aac -b:a 128k' : '-an';
-      await execPromise(`ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c:v libx264 -profile:v high -level 4.2 ${MEM_SAFE_VIDEO_ARGS} -pix_fmt yuv420p -r 30 ${concatAudio} -movflags +faststart -threads 1 "${concatenatedPath}"`);
 
-      const durationProbe = await execPromise(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${concatenatedPath}"`);
-      const currentDuration = Number.parseFloat(durationProbe.stdout.trim()) || 0;
+      // CONCAT (fast path): every segment is emitted by this same encoder with
+      // identical codec/profile/pix_fmt/fps/geometry, so the concat demuxer can
+      // join them with a pure stream copy (`-c copy`) — no decode, no re-encode.
+      //
+      // A stream copy is only valid when the segments are truly compatible. When
+      // they are not, `-c copy` can either FAIL or — more insidiously — silently
+      // append coded frames of a different codec/pix_fmt, producing a file that
+      // plays but is corrupted. So before copying we probe every segment's video
+      // (codec/pix_fmt/geometry) and audio (codec/sample_rate/channels) and only
+      // take the copy path when they all match the first. Otherwise we use the
+      // ORIGINAL full re-encode below, preserving the exact prior behaviour.
+      const probeSignature = async (file: string) => {
+        const { stdout } = await execPromise(`ffprobe -v error -show_entries stream=codec_type,codec_name,pix_fmt,width,height,sample_rate,channels -of json ${JSON.stringify(file)}`);
+        const parsed = JSON.parse(stdout);
+        const streams: any[] = Array.isArray(parsed.streams) ? parsed.streams : [];
+        const v = streams.find((s) => s.codec_type === 'video');
+        const a = streams.find((s) => s.codec_type === 'audio');
+        return {
+          v: v ? `${v.codec_name}|${v.pix_fmt}|${v.width}x${v.height}` : 'none',
+          a: a ? `${a.codec_name}|${a.sample_rate}|${a.channels}` : 'none',
+        };
+      };
+      let segmentsCompatible: boolean;
+      try {
+        const sigs = await Promise.all(segmentFiles.map(probeSignature));
+        segmentsCompatible = sigs.every((s) => s.v === sigs[0].v)
+          && (!hasAudio || sigs.every((s) => s.a === sigs[0].a));
+      } catch (probeErr: any) {
+        // If we cannot prove compatibility, stay conservative and re-encode.
+        segmentsCompatible = false;
+        console.warn(`[ffmpegEngine] concat compatibility probe failed (${String(probeErr?.message || probeErr).split('\n')[0]}); defaulting to full re-encode.`);
+      }
+      console.log(`[ffmpegEngine] concat compatibility: ${segmentsCompatible ? 'segments compatible (copy path)' : 'mismatch detected (re-encode path)'}`);
+
+      const concatAudioCopy = hasAudio ? '-c:a copy' : '-an';
+      const concatAudioReencode = hasAudio ? '-c:a aac -b:a 128k' : '-an';
+      const concatCopyCmd = `ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy ${concatAudioCopy} -movflags +faststart "${concatenatedPath}"`;
+      const concatFallbackCmd = `ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c:v libx264 -profile:v high -level 4.2 ${MEM_SAFE_VIDEO_ARGS} -pix_fmt yuv420p -r 30 ${concatAudioReencode} -movflags +faststart -threads 1 "${concatenatedPath}"`;
+
+      const concatStart = Date.now();
+      let concatMode: 'copy' | 'reencode' = 'copy';
+      let concatPeakRssKb = 0;
+      if (segmentsCompatible) {
+        try {
+          concatPeakRssKb = (await execWithProgress(concatCopyCmd)).peakRssKb;
+        } catch (copyErr: any) {
+          concatMode = 'reencode';
+          console.warn(`[ffmpegEngine] concat -c copy failed (${String(copyErr?.message || copyErr).split('\n')[0]}); falling back to full re-encode.`);
+          try { fs.rmSync(concatenatedPath, { force: true }); } catch {}
+          concatPeakRssKb = (await execWithProgress(concatFallbackCmd)).peakRssKb;
+        }
+      } else {
+        concatMode = 'reencode';
+        concatPeakRssKb = (await execWithProgress(concatFallbackCmd)).peakRssKb;
+      }
+      console.log(`[ffmpegEngine] concat (${concatMode}) done in ${((Date.now() - concatStart) / 1000).toFixed(2)}s, peakRSS=${Math.round(concatPeakRssKb / 1024)}MB`);
+
+      let durationProbe = await execPromise(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${concatenatedPath}"`);
+      let currentDuration = Number.parseFloat(durationProbe.stdout.trim()) || 0;
+      // Guard the rare "copy succeeded but produced an unusable container" case:
+      // if a stream copy yields no readable duration, redo it with the fallback.
+      if (concatMode === 'copy' && currentDuration < 1) {
+        concatMode = 'reencode';
+        console.warn('[ffmpegEngine] concat -c copy produced no usable duration; falling back to full re-encode.');
+        try { fs.rmSync(concatenatedPath, { force: true }); } catch {}
+        await execWithProgress(concatFallbackCmd);
+        durationProbe = await execPromise(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${concatenatedPath}"`);
+        currentDuration = Number.parseFloat(durationProbe.stdout.trim()) || 0;
+      }
       const finalMasterPath = path.join(this.outputDir, 'final_video.mp4');
       const posterPath = path.join(this.outputDir, 'final_video_poster.jpg');
       onProgress?.({ percent: 88, stage: 'Finishing 1080x1920 / 30fps / 64.00s master...' });
@@ -309,6 +462,8 @@ export class FFmpegEngine {
       // vignette is an `eval=init` (single precomputed map) and unsharp is a local
       // 5x5 kernel — doing them here instead of on every clip yields the same look
       // for ~1s total instead of ~4-7s × shot count.
+      // The master also emits `-progress pipe:1` (via execWithProgress) so the bar
+      // advances smoothly from 88% to 100% instead of freezing until the end.
       const masterGrade = 'vignette=PI/5:eval=init,unsharp=5:5:0.35:5:5:0';
       let masterCmd: string;
       if (hasAudio) {
@@ -321,7 +476,17 @@ export class FFmpegEngine {
       } else {
         masterCmd = `ffmpeg -y -i "${concatenatedPath}" -vf "tpad=stop_mode=clone:stop_duration=${pad.toFixed(3)},trim=duration=64,setpts=PTS-STARTPTS,${masterGrade}" -t 64 -c:v libx264 -profile:v high -level 4.2 ${MEM_SAFE_VIDEO_ARGS} -pix_fmt yuv420p -r 30 -an -movflags +faststart -threads 1 "${finalMasterPath}"`;
       }
-      await execPromise(masterCmd);
+      const masterStart = Date.now();
+      let lastMasterPercent = 88;
+      const masterRun = await execWithProgress(masterCmd, (seconds) => {
+        // Map the master's own timeline (0..64s) onto the remaining 88 -> 100% band.
+        const percent = Math.min(100, Math.max(88, Math.round(88 + (seconds / 64) * 12)));
+        if (percent > lastMasterPercent) {
+          lastMasterPercent = percent;
+          onProgress?.({ percent, stage: `Master render 1080x1920 / 30fps: ${seconds.toFixed(1)}s / 64.00s...` });
+        }
+      });
+      console.log(`[ffmpegEngine] master done in ${((Date.now() - masterStart) / 1000).toFixed(2)}s, peakRSS=${Math.round(masterRun.peakRssKb / 1024)}MB`);
 
       try { await execPromise(`ffmpeg -y -ss 12 -i "${finalMasterPath}" -vframes 1 -q:v 2 "${posterPath}"`); } catch {}
 
@@ -358,6 +523,7 @@ export class FFmpegEngine {
       let posterUrl = storage.publicUrlFor(posterPath);
       if (fs.existsSync(posterPath)) posterUrl = (await storage.publish(posterPath)).url;
       onProgress?.({ percent: 100, stage: 'Premium 64.00s cinematic reel ready.' });
+      console.log(`[ffmpegEngine] total render done in ${((Date.now() - renderStart) / 1000).toFixed(2)}s`);
       const now = Date.now();
       return {
         videoUrl: `${finalVideo.url}?t=${now}`,
