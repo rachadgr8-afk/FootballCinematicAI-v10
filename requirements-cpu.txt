@@ -7,7 +7,13 @@ torch==2.6.0+cpu
 torchvision==0.21.0+cpu
 
 ultralytics>=8.3.0
-opencv-python-headless>=4.10.0
+
+# Pinned so the OpenCV wheel and numpy stay ABI-compatible: opencv-python 4.11+
+# wheels are built against numpy>=2, while torch 2.6+cpu resolves numpy<2. A
+# mismatch makes `import cv2` fail at runtime, which would silently force the
+# local analysis into fallback mode.
+numpy>=1.26,<2
+opencv-python-headless==4.10.0.84
 
 # RIFE is optional and NOT a Python package: it is invoked as a subprocess from a
 # separately cloned repository (see RIFE_INSTALL.md / RIFE_REPO env var). Installing

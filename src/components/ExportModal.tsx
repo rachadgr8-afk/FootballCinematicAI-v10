@@ -65,7 +65,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose, onNewProject 
       try {
         await navigator.share({
           title: 'FOOTBALL CINEMATIC AI Short',
-          text: 'Check out this 64-second cinematic football master short created with Gemini & Veo!',
+          text: 'Check out this 64-second cinematic football master short created with local AI motion editing!',
           url: window.location.href,
         });
       } catch (err) {}

@@ -1,7 +1,7 @@
 /**
  * WebAudio Football Cinematic Sound Engine
  * Dynamically synthesizes orchestral hybrid percussion, sub-bass braams,
- * crowd atmosphere, and riser impacts synchronized to Gemini's BPM & energy curve.
+ * crowd atmosphere, and riser impacts synchronized to the edit plan's BPM & energy curve.
  */
 
 export class FootballAudioEngine {

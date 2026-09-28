@@ -159,7 +159,7 @@ export default function App() {
       setActivePlayerTitle(`Uploaded: ${file.name}`);
       setUploadedFileName(file.name);
       setIsMasterRendered(false);
-      setTestStatus(`Video uploaded & verified! Ready for Gemini analysis and real FFmpeg rendering.`);
+      setTestStatus(`Video uploaded & verified! Ready for local motion analysis and real FFmpeg rendering.`);
     } catch (err: any) {
       console.error('Upload handler notice:', err.message || err);
       setTestStatus(`Upload notice: ${err.message || 'Could not upload video.'}`);
@@ -271,14 +271,14 @@ export default function App() {
     }
   };
 
-  // COMPLETE REAL PIPELINE: Gemini Plan -> Real FFmpeg Execution -> final_video.mp4
+  // COMPLETE REAL PIPELINE: Local motion plan -> Real FFmpeg Execution -> final_video.mp4
   const runCompleteRealPipeline = async (customStyle?: AIStyle) => {
     if (!selectedVideo) return;
     const styleToUse = customStyle || selectedStyle;
 
     setIsRenderingFull(true);
     setPipelineError(null);
-    setRenderProgress({ percent: 5, stage: 'Gemini inspecting real video timestamps...' });
+    setRenderProgress({ percent: 5, stage: 'Analyzing local motion of the uploaded footage...' });
 
     try {
       const versionData = await safeFetchJson<any>('/api/version', { method: 'GET' });
@@ -290,7 +290,7 @@ export default function App() {
         );
       }
 
-      // 1. Gemini Analysis
+      // 1. Local motion analysis (no external API)
       const analyzeData = await safeFetchJson<{
         success: boolean;
         editPlan?: EditPlan;
@@ -307,7 +307,7 @@ export default function App() {
       });
 
       if (!analyzeData.success || !analyzeData.editPlan) {
-        throw new Error('Failed to obtain Gemini edit plan');
+        throw new Error('Failed to obtain the local edit plan');
       }
 
       let activePlan: EditPlan = analyzeData.editPlan;
@@ -340,7 +340,7 @@ export default function App() {
         throw new Error(renderData.error || 'FFmpeg rendering failed');
       }
 
-      // 3. Gemini QC Review
+      // 3. Local Quality Control review
       try {
         const qcData = await safeFetchJson<{
           success: boolean;
@@ -375,7 +375,7 @@ export default function App() {
             };
             activePlan = revisedPlan;
             setEditPlan(revisedPlan);
-            setRenderProgress({ percent: 92, stage: 'Gemini found pacing issues — applying one automatic polish pass...' });
+            setRenderProgress({ percent: 92, stage: 'Local QC found pacing issues — applying one automatic polish pass...' });
             const polishData = await safeFetchJson<any>('/api/render-full-cinematic', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -493,7 +493,7 @@ export default function App() {
                 FOOTBALL CINEMATIC AI
               </h1>
               <p className="text-[11px] text-slate-400">
-                Real FFmpeg Video Engine • Gemini Director • Android Media3
+                Real FFmpeg Video Engine • Local Motion Director • Android Media3
               </p>
             </div>
           </div>
@@ -715,17 +715,17 @@ export default function App() {
               </div>
             </div>
 
-            {/* AI GENERATION MODE */}
+            {/* RENDER MODE */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col gap-2.5">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">AI Generation Mode</span>
-                <span className="text-[10px] text-amber-300">Veo 3.1 inserts are real generated MP4 clips</span>
+                <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">Render Mode</span>
+                <span className="text-[10px] text-emerald-300">100% local render — no external API</span>
               </div>
               <div className="grid grid-cols-3 gap-2">
                 {([
                   { id: 'ORIGINAL FOOTAGE ONLY', label: 'Source Only' },
-                  { id: 'AI ENHANCED', label: 'AI Enhanced' },
-                  { id: 'AI CINEMATIC', label: 'AI Cinematic' },
+                  { id: 'AI ENHANCED', label: 'Enhanced' },
+                  { id: 'AI CINEMATIC', label: 'Cinematic' },
                 ] as { id: GenerationTier; label: string }[]).map((tier) => (
                   <button
                     key={tier.id}
@@ -739,7 +739,7 @@ export default function App() {
                 ))}
               </div>
               <p className="text-[10px] text-slate-400">
-                AI Cinematic generates up to 3 short 9:16 bridge/detail shots from real source frames; the main action and climax remain grounded in the uploaded footage.
+                Every mode renders strictly from the uploaded footage with the local FFmpeg engine. Cinematic adds stronger local color grading and extra close-up inserts. No external AI video API is ever called.
               </p>
             </div>
 
@@ -751,7 +751,7 @@ export default function App() {
                     Full 64-Second Master Assembly
                   </h4>
                   <p className="text-[11px] text-slate-400">
-                    Gemini timestamps → optional Veo 3.1 inserts → cinematic reframing → speed ramps → captions → Final MP4
+                    Local motion analysis → cinematic reframing → speed ramps → captions → Final MP4
                   </p>
                 </div>
               </div>

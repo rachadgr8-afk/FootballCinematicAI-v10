@@ -23,7 +23,7 @@ export const GeminiQCPanel: React.FC<GeminiQCPanelProps> = ({ review, onClose })
             <ShieldCheck className="w-4 h-4" />
           </div>
           <div>
-            <h4 className="font-bold text-sm text-white">Gemini Editorial Quality Control</h4>
+            <h4 className="font-bold text-sm text-white">Editorial Quality Control</h4>
             <p className="text-[11px] text-slate-400">Sports Director Rigorous Review</p>
           </div>
         </div>

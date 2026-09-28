@@ -19,11 +19,11 @@ interface PipelineProgressModalProps {
 
 const STAGES_CONFIG = [
   { id: 'uploading', label: 'Uploading...', icon: Upload, desc: 'Processing raw football video frames' },
-  { id: 'analyzing', label: 'Analyzing with Gemini...', icon: Cpu, desc: 'Detecting players, ball, dribbles, passes & emotional intensity' },
+  { id: 'analyzing', label: 'Analyzing local motion...', icon: Cpu, desc: 'Sampling the uploaded footage: slow build-up vs high-motion impact moments' },
   { id: 'building_story', label: 'Building story...', icon: Film, desc: 'Structuring 64-second vertical narrative & climax timing' },
-  { id: 'generating_veo', label: 'Generating cinematic shots...', icon: Sparkles, desc: 'Veo 3.1 neural football cinematography synthesis' },
+  { id: 'generating_veo', label: 'Preparing cinematic inserts...', icon: Sparkles, desc: 'Local close-up / detail inserts selected from the real footage' },
   { id: 'editing', label: 'Editing...', icon: Scissors, desc: 'Local video engine: smart 9:16 crop, zoom push-in, sound sync' },
-  { id: 'ai_review', label: 'AI reviewing...', icon: FileCheck, desc: 'Gemini Quality Control checking pacing and climax impact' },
+  { id: 'ai_review', label: 'Local reviewing...', icon: FileCheck, desc: 'Local Quality Control checking pacing and climax impact' },
   { id: 'final_render', label: 'Final rendering...', icon: CheckCircle2, desc: 'Assembling 1080x1920 64-second master short' },
 ];
 

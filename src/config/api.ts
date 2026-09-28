@@ -74,7 +74,7 @@ export function getFriendlyErrorMessage(status: number, bodySnippet: string = ''
     case 415:
       return 'Video format is not supported. Please select an MP4, MOV, or WEBM file.';
     case 429:
-      return 'Gemini API quota is momentarily exhausted on every key. The server rotates keys automatically — please retry in a few seconds.';
+      return 'The server is momentarily busy. Video analysis runs locally — please retry in a few seconds.';
     case 500:
       return `The server encountered an internal error while handling${route || ' the request'}. Check the server logs for details.`;
     case 502:

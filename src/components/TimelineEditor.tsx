@@ -109,7 +109,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                     #{idx + 1}
                   </span>
                   {clip.veo_needed && (
-                    <span title="Veo Shot">
+                    <span title="Cinematic insert">
                       <Sparkles className="w-2.5 h-2.5 text-amber-400" />
                     </span>
                   )}
@@ -146,7 +146,7 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                   className="rounded text-emerald-500 focus:ring-emerald-400"
                 />
                 <Sparkles className="w-3 h-3 text-amber-400" />
-                <span className="text-[11px] font-bold">Veo 3.1 Shot</span>
+                <span className="text-[11px] font-bold">Cinematic Insert</span>
               </label>
             </div>
           </div>

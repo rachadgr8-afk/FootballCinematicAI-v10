@@ -89,7 +89,7 @@ export const ReferenceStyleModal: React.FC<ReferenceStyleModalProps> = ({
         <div className="flex items-start gap-2 bg-purple-950/40 border border-purple-800/60 rounded-xl p-3 text-xs text-purple-200">
           <HelpCircle className="w-4 h-4 text-purple-400 shrink-0 mt-0.5" />
           <p>
-            Gemini copies purely editorial rhythm (average shot length, zoom curves, transition
+            The local profile copies purely editorial rhythm (average shot length, zoom curves, transition
             frequencies) — zero copyrighted logos, watermarks, or footage are cloned.
           </p>
         </div>
@@ -127,7 +127,7 @@ export const ReferenceStyleModal: React.FC<ReferenceStyleModalProps> = ({
             className="w-full py-2 px-4 rounded-xl bg-purple-600 hover:bg-purple-500 font-semibold text-xs text-white flex items-center justify-center gap-2 transition disabled:opacity-50"
           >
             <Sparkles className="w-4 h-4" />
-            {isAnalyzing ? 'Extracting Style Profile with Gemini...' : 'Analyze Reference Style'}
+            {isAnalyzing ? 'Extracting Style Profile locally...' : 'Analyze Reference Style'}
           </button>
         </div>
 
