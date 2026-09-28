@@ -1,0 +1,51 @@
+# ============================================================================
+# OPTIONAL SAM RUNTIME — INSTALL IN AN ISOLATED INTERPRETER / VENV ONLY
+# ----------------------------------------------------------------------------
+# DO NOT install these into the main project interpreter. The main stack is
+# intentionally pinned to CPU-safe, ABI-stable versions:
+#
+#     torch==2.6.0+cpu   numpy<2   opencv-python-headless==4.10.0.84
+#
+# Meta SAM 3.1 currently requires Python 3.12+, PyTorch 2.7+ and CUDA 12.6+.
+# Upgrading torch in the MAIN interpreter to satisfy SAM would break YOLO
+# (ultralytics) and the OpenCV/numpy pairing, so SAM MUST live in its own venv.
+#
+# Recommended setup (does not touch the main environment):
+#
+#     python3.12 -m venv /opt/sam-venv
+#     /opt/sam-venv/bin/pip install --upgrade pip
+#     /opt/sam-venv/bin/pip install -r python/sam_requirements.txt
+#
+# Then point the server at it:
+#
+#     export SAM_ENABLED=true
+#     export SAM_PYTHON_BIN=/opt/sam-venv/bin/python
+#     export SAM_MODEL_PATH=/opt/sam-models/sam3.1.pt
+#     export SAM_ADAPTER=auto          # auto | meta | mock
+#
+# If the adapter venv is missing or the model file is absent, the engine
+# degrades gracefully: it logs a clear message and the render falls back to the
+# existing YOLO/tracking pipeline. Nothing in the main project breaks.
+# ============================================================================
+
+# --- Minimal, shareable core (needed by BOTH the classical fallback and Meta) -
+numpy>=1.26,<3
+opencv-python-headless>=4.10.0.84
+
+# --- Meta Segment Anything --------------------------------------------------
+# Install the build that matches your checkpoint. Only ONE is required.
+#
+#   Segment Anything 1 (vit_h / vit_l / vit_b):
+# segment-anything==1.0
+#
+#   Segment Anything 2:
+# git+https://github.com/facebookresearch/sam2.git
+#
+#   Segment Anything 3 / 3.1 (text-promptable):
+# git+https://github.com/facebookresearch/sam3.git
+#
+# NOTE: the SAM packages above pin their OWN torch/torchvision versions. This is
+# exactly why the isolated venv exists — let pip resolve torch here freely:
+
+# torch>=2.7            # resolved transitively by the SAM package; 2.7+ for SAM 3.1
+# torchvision           # resolved transitively

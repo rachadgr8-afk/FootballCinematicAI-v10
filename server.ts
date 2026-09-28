@@ -11,6 +11,7 @@ import { ffmpegEngine, FFmpegProgress } from './server/ffmpegEngine';
 import { storage } from './server/storage';
 import { geminiRotator } from './server/geminiRotator';
 import { cinematicEngine } from './server/cinematicEngine';
+import { samService } from './server/samService';
 
 const execPromise = util.promisify(exec);
 
@@ -59,9 +60,12 @@ app.get('/api/version', (req, res) => {
     success: true,
     service: 'fotbal-backend',
     buildVersion: BUILD_VERSION,
-    pipeline: 'football-director-v10 + LOCAL-motion-analysis (no external video API) + evidence-engine + YOLO-ByteTrack + ReID + event-engine + beat-sync + scene-aware-RIFE + ffmpeg',
+    pipeline: 'football-director-v10 + LOCAL-motion-analysis (no external video API) + evidence-engine + YOLO-ByteTrack + ReID + event-engine + optional-SAM-segmentation + beat-sync + scene-aware-RIFE + ffmpeg',
     videoAnalysis: 'local-opencv-motion',
     externalVideoApi: false,
+    // OPTIONAL SAM layer: reported as a capability flag only — the heavy engine
+    // lives in its own isolated interpreter and is OFF unless SAM_ENABLED=true.
+    sam: { enabled: samService.enabled, adapter: process.env.SAM_ADAPTER || 'auto', isolated: Boolean(process.env.SAM_PYTHON_BIN) },
     geminiKeys: geminiRotator.count(),
     activeGeminiKeys: geminiRotator.activeCount(),
   });
@@ -415,6 +419,58 @@ async function prepareVeoEnhancements(inputPath: string, editPlan: any, _generat
   }
 
   return editPlan;
+}
+
+// ---------------------------------------------------------------------------
+// OPTIONAL SAM SEGMENTATION / TRACKING — pre-pass integration.
+//
+// Runs BETWEEN the existing football analysis and the existing CinematicEngine,
+// reusing the SAME per-clip 'sam' annotation seam the renderer understands.
+// DEFAULT BEHAVIOUR IS UNCHANGED: inert unless SAM_ENABLED=true, and every
+// failure degrades to { applied:false } so the YOLO/tracking path is untouched.
+// It only ever touches the INTERESTING SEGMENTS the edit plan already selected.
+// ---------------------------------------------------------------------------
+function resolveSamArtifacts(editPlan: any, explicit?: { trackingPath?: string; eventsPath?: string }) {
+  const trackingPath = explicit?.trackingPath && fs.existsSync(explicit.trackingPath) ? explicit.trackingPath : undefined;
+  const eventsPath = explicit?.eventsPath && fs.existsSync(explicit.eventsPath) ? explicit.eventsPath : undefined;
+  if (trackingPath && eventsPath) return { trackingPath, eventsPath };
+
+  // The plan produced by /api/analyze-video carries the football-director
+  // evidence, which references the events file. Derive the sibling tracking.json
+  // from it (both live under the same yolo_<ts>/ directory) instead of
+  // re-running any detection.
+  const evidence = editPlan?.footballDirectorEvidence;
+  let resolvedEvents = eventsPath;
+  if (!resolvedEvents && typeof evidence?.eventsPath === 'string' && fs.existsSync(evidence.eventsPath)) {
+    resolvedEvents = evidence.eventsPath;
+  }
+  let resolvedTracking = trackingPath;
+  if (!resolvedTracking && resolvedEvents) {
+    // <videosDir>/yolo_<ts>/director_<ts>/events.json  ->  <videosDir>/yolo_<ts>/tracking.json
+    const yoloDir = path.dirname(path.dirname(resolvedEvents));
+    const candidate = path.join(yoloDir, 'tracking.json');
+    if (fs.existsSync(candidate)) resolvedTracking = candidate;
+  }
+  return { trackingPath: resolvedTracking, eventsPath: resolvedEvents };
+}
+
+async function applySamPrePass(
+  inputPath: string,
+  editPlan: any,
+  onProgress?: (progress: FFmpegProgress) => void,
+  explicit?: { trackingPath?: string; eventsPath?: string }
+): Promise<{ applied: boolean }> {
+  if (!samService.enabled) return { applied: false };
+  try {
+    const artifacts = resolveSamArtifacts(editPlan, explicit);
+    const res = await samService.enhanceRenderPlan(inputPath, editPlan, artifacts, (p) =>
+      onProgress?.({ percent: p.percent, stage: p.stage })
+    );
+    return { applied: res.applied };
+  } catch (err: any) {
+    console.warn('[SAM] pre-pass skipped:', err?.message || err);
+    return { applied: false };
+  }
 }
 
 // Live render progress tracking
@@ -935,13 +991,41 @@ function updateJob(job: RenderJob, patch: Partial<RenderJob>): void {
  */
 async function runFullRenderJob(
   jobId: string,
-  params: { localPath: string; editPlan: any; musicVolume: number; originalVolume: number; generationTier: string; rifeMultiplier: number }
+  params: { localPath: string; editPlan: any; musicVolume: number; originalVolume: number; generationTier: string; rifeMultiplier: number; precomputedArtifacts?: { trackingPath?: string; eventsPath?: string } }
 ): Promise<void> {
   const job = renderJobs.get(jobId)!;
-  const { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier } = params;
+  const { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier, precomputedArtifacts } = params;
   let generatedVeoPaths: string[] = [];
+  let samApplied = false;
   try {
     const preparedPlan = await prepareVeoEnhancements(localPath, editPlan, generationTier, (p) => updateJob(job, { percent: p.percent, stage: p.stage }));
+
+    // OPTIONAL SAM segmentation/tracking pre-pass (opt-in; inert by default).
+    // Runs AFTER the existing analysis produced the edit plan and BEFORE the
+    // existing CinematicEngine renders it. Any failure leaves the plan untouched.
+    if (samService.enabled) {
+      updateJob(job, { percent: 10, stage: 'Preparing segmentation...' });
+      let artifacts = precomputedArtifacts;
+      if (!resolveSamArtifacts(preparedPlan, artifacts).trackingPath) {
+        // SAM needs YOLO DETECTION prompts (SAM never detects by itself). If the
+        // analyze step ran with YOLO off (the CPU default), reuse the EXISTING
+        // bounded YOLO tracker ONCE here so the interesting segments can be
+        // segmented. This reuses the same function the analysis stage uses.
+        try {
+          const tracking = await runYoloTracking(localPath, (p) => updateJob(job, { percent: p.percent, stage: p.stage }));
+          const evidence = await runFootballEvidence(localPath, tracking);
+          artifacts = {
+            trackingPath: tracking?.jsonUrl ? path.join(videosDir, String(tracking.jsonUrl).replace(/^\/videos\//, '')) : undefined,
+            eventsPath: evidence?.eventsPath,
+          };
+        } catch (trackErr: any) {
+          console.warn('[SAM] detection pass skipped:', trackErr?.message || trackErr);
+        }
+      }
+      await applySamPrePass(localPath, preparedPlan, (p) => updateJob(job, { percent: p.percent, stage: p.stage }), artifacts);
+      samApplied = Boolean((preparedPlan as any).samSegmentation?.applied);
+    }
+
     // NOTE: engine-generated slow-motion files are registered as clip.veo_local_path
     // by the pre-pass, so this list already covers them (cleaned up in finally).
     generatedVeoPaths = preparedPlan.timeline.map((c: any) => c.veo_local_path).filter((p: any) => typeof p === 'string');
@@ -976,6 +1060,10 @@ async function runFullRenderJob(
       aiEnhanced: generationTier !== 'ORIGINAL FOOTAGE ONLY' && generatedVeoPaths.length > 0,
       rifeApplied,
       rifeMultiplier: rifeApplied ? rifeMultiplier : 0,
+      // Additive observability flag: whether the OPTIONAL SAM layer contributed
+      // subject-isolation references to this render. The frontend contract is
+      // unchanged (extra field only).
+      samApplied,
     };
     updateJob(job, { percent: 100, status: 'done', stage: rifeApplied ? 'Cinematic render + RIFE complete.' : 'Cinematic render complete.', result: payload });
     console.log(`[RENDER JOB ${jobId}] done in ${((Date.now() - job.startedAt) / 1000).toFixed(1)}s`);
@@ -994,7 +1082,7 @@ async function runFullRenderJob(
 
 // 6. POST /api/render-full-cinematic — starts a render job, returns immediately.
 app.post('/api/render-full-cinematic', async (req, res) => {
-  const { localPath, editPlan, musicVolume = 0.8, originalVolume = 0.9, generationTier = 'ORIGINAL FOOTAGE ONLY', rifeMultiplier } = req.body || {};
+  const { localPath, editPlan, musicVolume = 0.8, originalVolume = 0.9, generationTier = 'ORIGINAL FOOTAGE ONLY', rifeMultiplier, artifacts } = req.body || {};
   if (!localPath || !fs.existsSync(localPath)) {
     return res.status(400).json({ success: false, error: 'Valid uploaded video localPath is required.' });
   }
@@ -1026,8 +1114,13 @@ app.post('/api/render-full-cinematic', async (req, res) => {
   currentRenderProgress = { percent: 0, stage: job.stage };
 
   const multiplier = Number(rifeMultiplier || process.env.RIFE_FPS_MULTIPLIER || 2);
+  // Optional SAM artefacts (existing tracking/events paths) may be forwarded by
+  // the analyze step so SAM never re-runs detection needlessly.
+  const precomputedArtifacts = artifacts && typeof artifacts === 'object'
+    ? { trackingPath: artifacts.trackingPath, eventsPath: artifacts.eventsPath }
+    : undefined;
   // Fire-and-forget: the heavy work continues after this response is sent.
-  void runFullRenderJob(jobId, { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier: multiplier });
+  void runFullRenderJob(jobId, { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier: multiplier, precomputedArtifacts });
 
   return res.status(202).json({
     success: true,
@@ -1294,6 +1387,19 @@ async function muxCommentary(videoPath: string, audioPath: string): Promise<stri
 
 app.get('/api/yolo/status', (req, res) => {
   res.json({ success: true, enabled: process.env.YOLO_ENABLED === 'true', model: process.env.YOLO_MODEL_PATH || 'models/best.pt', tracker: 'ByteTrack' });
+});
+
+// OPTIONAL SAM layer status. This is a read-only readiness probe (no model load,
+// no network) so it is safe to poll from the UI. It NEVER starts a render and it
+// respects the existing frontend contract (always returns JSON).
+app.get('/api/sam/status', async (req, res) => {
+  try {
+    const force = req.query.refresh === '1';
+    const status = await samService.status(force);
+    res.json({ success: true, ...status });
+  } catch (err: any) {
+    res.json({ success: true, enabled: samService.enabled, available: false, reason: err?.message || 'status unavailable' });
+  }
 });
 
 

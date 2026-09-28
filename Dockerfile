@@ -82,6 +82,12 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/public ./public
 COPY yolo ./yolo
 COPY models ./models
+# OPTIONAL SAM segmentation/tracking engine (python/sam_engine.py + adapters).
+# Copied so the bundled server.js can spawn it. SAM is OFF by default; if its
+# isolated interpreter/model are absent the engine degrades gracefully and the
+# render falls back to the existing YOLO/tracking path.
+COPY python ./python
+COPY config ./config
 # Standalone OpenCV+NumPy cinematic engine (class CinematicEngine) used by the
 # OPTIONAL server/cinematicEngine.ts bridge. Copied to the app root so the
 # bundled server.js can spawn `python3 video_engine.py`.
@@ -111,6 +117,7 @@ ENV STORAGE_DRIVER=local \
     PUBLIC_DIR=/app/public/videos \
     PYTHON_BIN=/opt/yolo-venv/bin/python \
     YOLO_ENABLED=false \
+    SAM_ENABLED=false \
     YOLO_MAX_SECONDS=120 \
     YOLO_STRIDE=3 \
     YOLO_TIMEOUT_MS=180000 \

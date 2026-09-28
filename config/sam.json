@@ -1,0 +1,33 @@
+{
+  "version": "sam-1.0.0",
+  "description": "OPTIONAL Meta SAM 3.1 cinematic segmentation/tracking layer. OFF by default (SAM_ENABLED=false); when disabled or unavailable the render falls back to the existing YOLO/tracking path untouched.",
+  "enabled": false,
+  "adapter": "auto",
+  "isolation": {
+    "maskMode": "rle",
+    "maskResolution": 512,
+    "stride": 4,
+    "maxFramesPerSegment": 6,
+    "maxSegments": 8,
+    "maxObjectsPerSegment": 3,
+    "deadlineSeconds": 120,
+    "cacheMaxEntries": 500
+  },
+  "isolationReasons": [
+    "shot",
+    "goal",
+    "dribble",
+    "tackle",
+    "save",
+    "celebration"
+  ],
+  "appliedMap": {
+    "goal": "background_dimming",
+    "shot": "subject_isolation",
+    "save": "background_blur",
+    "tackle": "player_highlight",
+    "dribble": "selective_sharpening",
+    "celebration": "cinematic_vignette_focus"
+  },
+  "notes": "Meta SAM 3.1 needs Python 3.12+/PyTorch 2.7+/CUDA 12.6+. Run it in an isolated interpreter (SAM_PYTHON_BIN) so the main CPU stack (torch 2.6.0+cpu, numpy<2, opencv-headless 4.10.0.84) stays untouched."
+}

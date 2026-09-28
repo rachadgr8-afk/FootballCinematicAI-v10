@@ -49,3 +49,6 @@ public/videos/final_commentary_*.mp4
 server.js
 public/videos/final_video.mp4
 public/videos/final_video_poster.jpg
+
+# SAM runtime cache (compressed masks — regenerated, never committed)
+python/cache/
