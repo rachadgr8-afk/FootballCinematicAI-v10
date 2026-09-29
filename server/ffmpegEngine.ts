@@ -390,6 +390,17 @@ export class FFmpegEngine {
         }
 
         const transition = String(clip.transition || 'hard_cut');
+        // OPTIONAL psychological framing (additive; inert when absent).
+        // LOW-ANGLE GROUND POV: a restrained upward push from a lower focal
+        // point — no stretching, no distortion, the subject stays natural.
+        if (clip.low_angle === true) {
+          vf += `,zoompan=z='${(Math.min(1.18, zoomStart + 0.02)).toFixed(3)}':x='(iw-iw/zoom)*${safe(cropX, 0.5, 0.05, 0.95).toFixed(4)}':y='(ih-ih/zoom)*${safe(Math.max(0.62, cropY), 0.62, 0.05, 0.98).toFixed(4)}':d=1:s=1080x1920:fps=30`;
+        }
+        // POV SWITCH: a very short, eased micro push-in accent on a real trigger,
+        // then it settles — never a jolt.
+        if (clip.pov_switch === true) {
+          vf += `,eq=contrast=1.06:enable='between(t,0,0.22)'`;
+        }
         if (transition === 'flash') {
           vf += `,eq=brightness='if(lt(t,0.10),0.22*(1-t/0.10),0)'`;
         } else if (transition === 'directional_blur') {
@@ -545,6 +556,20 @@ export class FFmpegEngine {
       }
       if (gradeCfg.prevent_neon_grass !== false) masterGradeParts.push('hue=s=0.97');
       if (gradeCfg.protect_skin_tones !== false) masterGradeParts.push('colorbalance=rm=0.022:gm=0.006');
+      // OPTIONAL psychological teal-orange (Predator vs Prey). ADDITIVE: it only
+      // runs when the plan carries a psychological grade block; the global grading
+      // above is never replaced. Cool shadows, warm highlights, controlled
+      // contrast, protected skin and a subtle vignette — never a neon wash.
+      const psych = gradeCfg.psychological;
+      if (psych && psych.enabled) {
+        const pc = String(psych.name || 'psychological_teal_orange');
+        masterGradeParts.push(`curves=all='0/0 0.25/0.22 0.5/0.5 0.75/0.78 1/1'`); // controlled contrast S-curve
+        masterGradeParts.push(`colorbalance=bs=${Number(psych.shadow_teal ?? 0.045).toFixed(3)}:rs=${Number(psych.shadow_teal_pull ?? -0.026).toFixed(3)}:rh=${Number(psych.highlight_warm ?? 0.032).toFixed(3)}:bh=${Number(psych.highlight_warm_pull ?? -0.024).toFixed(3)}`);
+        masterGradeParts.push(`hue=s=${Number(psych.grass_saturation ?? 0.93).toFixed(3)}`);
+        masterGradeParts.push('colorbalance=rm=0.026:gm=0.008'); // skin protection
+        masterGradeParts.push('vignette=PI/4.6:eval=init');
+        (editPlan as any).__psychGradeApplied = pc;
+      }
       const masterGrade = masterGradeParts.join(',');
       let masterCmd: string;
       if (hasAudio) {

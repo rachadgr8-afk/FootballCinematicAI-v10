@@ -13,6 +13,7 @@ import { geminiRotator } from './server/geminiRotator';
 import { cinematicEngine } from './server/cinematicEngine';
 import { samService } from './server/samService';
 import { referenceStyleService, CinematicMode } from './server/referenceStyleService';
+import { storytellerService } from './server/storytellerService';
 
 const execPromise = util.promisify(exec);
 
@@ -476,6 +477,38 @@ async function applySamPrePass(
 
 // Live render progress tracking
 let currentRenderProgress: FFmpegProgress = { percent: 0, stage: 'Idle' };
+
+/**
+ * Attach optional DEPTH masks (from the psychological depth pass) onto the plan's
+ * clips as a `sam`-shaped block, so the EXISTING renderer applies its
+ * subject-isolation path WITHOUT any new filter graph. Additive + opt-in: nothing
+ * happens unless the depth pass produced a real mask.
+ */
+function storyApplyDepth(editPlan: any, depthSegments: any[]): void {
+  const timeline = Array.isArray(editPlan?.timeline) ? editPlan.timeline : [];
+  if (!timeline.length || !Array.isArray(depthSegments) || !depthSegments.length) return;
+  for (const seg of depthSegments) {
+    if (!seg || typeof seg.maskRef !== 'string' || !fs.existsSync(seg.maskRef)) continue;
+    const t = Number(seg.time) || 0;
+    let bestIdx = 0;
+    let bestD = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < timeline.length; i++) {
+      const s = Number(timeline[i].source_start) || 0;
+      const e = Number(timeline[i].source_end) || s;
+      const d = t >= s && t <= e ? 0 : Math.min(Math.abs(t - s), Math.abs(t - e));
+      if (d < bestD) { bestD = d; bestIdx = i; }
+    }
+    const clip = timeline[bestIdx];
+    clip.depth_effect = 'depth_bokeh';
+    clip.sam = {
+      applied: true,
+      source: 'depth-anything-v2',
+      maskRef: seg.maskRef,
+      depth_strength: Number(seg.depth_strength) || 0.4,
+      foreground_ratio: Number(seg.foreground_ratio) || 0,
+    };
+  }
+}
 
 /**
  * Map a measured ReferenceStyleProfile onto the EXISTING StyleProfile contract.
@@ -1014,14 +1047,61 @@ function updateJob(job: RenderJob, patch: Partial<RenderJob>): void {
  */
 async function runFullRenderJob(
   jobId: string,
-  params: { localPath: string; editPlan: any; musicVolume: number; originalVolume: number; generationTier: string; rifeMultiplier: number; precomputedArtifacts?: { trackingPath?: string; eventsPath?: string } }
+  params: { localPath: string; editPlan: any; musicVolume: number; originalVolume: number; generationTier: string; rifeMultiplier: number; precomputedArtifacts?: { trackingPath?: string; eventsPath?: string }; storyteller?: boolean }
 ): Promise<void> {
   const job = renderJobs.get(jobId)!;
   const { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier, precomputedArtifacts } = params;
   let generatedVeoPaths: string[] = [];
   let samApplied = false;
+  let storytellingMetrics: Record<string, any> | null = null;
+  let storyScript: any[] = [];
   try {
     const preparedPlan = await prepareVeoEnhancements(localPath, editPlan, generationTier, (p) => updateJob(job, { percent: p.percent, stage: p.stage }));
+
+    // OPTIONAL psychological "Predator vs Prey" layer (opt-in; inert by default).
+    // Runs AFTER the existing analysis produced the edit plan and BEFORE the
+    // existing renderer. It only ADDS optional fields (story roles, story_script,
+    // depth/low-angle/POV hints) and leaves every existing field untouched. Any
+    // failure leaves the plan exactly as the GoalFlow cinematic pipeline built it.
+    if (storytellerService.wants(String((preparedPlan as any)?.cinematicMode || (preparedPlan as any)?.style_name || ''), preparedPlan, params.storyteller)) {
+      updateJob(job, { percent: 6, stage: 'Building the psychological story (duel detection)...' });
+      try {
+        const artifacts = storytellerService.resolveArtifacts(preparedPlan, precomputedArtifacts);
+        let duration = Number((preparedPlan as any)?.duration) || 0;
+        if (!Number.isFinite(duration) || duration <= 0) {
+          try {
+            const probe = await execPromise(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${JSON.stringify(localPath)}`);
+            duration = Number.parseFloat(probe.stdout.trim()) || 64;
+          } catch { duration = 64; }
+        }
+        const st = await storytellerService.enrich(localPath, duration, preparedPlan, artifacts);
+        if (st.applied) {
+          storytellingMetrics = st.metrics || null;
+          storyScript = Array.isArray((preparedPlan as any).story_script) ? (preparedPlan as any).story_script : [];
+          (preparedPlan as any).storyteller = {
+            applied: true,
+            duelDetected: Boolean(st.duelDetected),
+            duelConfidence: Number(st.duelConfidence || 0),
+            winner: st.winner ?? null,
+            story_script_count: storyScript.length,
+          };
+          // OPTIONAL depth pass — only for the duel/psychological segments the
+          // planner already marked. Inert unless DEPTH_ENABLED=true.
+          const depthSegs = (((st.bundle || {}) as any).depth_segments || []) as Array<{ time: number; span?: number }>;
+          if (depthSegs.length) {
+            const maskDir = path.resolve(process.env.SAM_CACHE_DIR || '/tmp/football_engine/work', 'depth_masks');
+            try { fs.mkdirSync(maskDir, { recursive: true }); } catch {}
+            const depth = await storytellerService.depth(localPath, depthSegs, maskDir);
+            if (depth.applied) {
+              storyApplyDepth(preparedPlan, depth.segments || []);
+              if (storytellingMetrics) storytellingMetrics.depth_effect_used = true;
+            }
+          }
+        }
+      } catch (stErr: any) {
+        console.warn('[Storyteller] layer skipped:', stErr?.message || stErr);
+      }
+    }
 
     // OPTIONAL SAM segmentation/tracking pre-pass (opt-in; inert by default).
     // Runs AFTER the existing analysis produced the edit plan and BEFORE the
@@ -1087,6 +1167,11 @@ async function runFullRenderJob(
       // subject-isolation references to this render. The frontend contract is
       // unchanged (extra field only).
       samApplied,
+      // Additive: the OPTIONAL psychological "Predator vs Prey" layer. `story_script`
+      // is always present ([] when the layer produced nothing), so existing clients
+      // keep working. All other existing fields (videoUrl/posterUrl/...) are intact.
+      story_script: Array.isArray(storyScript) ? storyScript : [],
+      storytelling: storytellingMetrics,
     };
     updateJob(job, { percent: 100, status: 'done', stage: rifeApplied ? 'Cinematic render + RIFE complete.' : 'Cinematic render complete.', result: payload });
     console.log(`[RENDER JOB ${jobId}] done in ${((Date.now() - job.startedAt) / 1000).toFixed(1)}s`);
@@ -1105,7 +1190,7 @@ async function runFullRenderJob(
 
 // 6. POST /api/render-full-cinematic — starts a render job, returns immediately.
 app.post('/api/render-full-cinematic', async (req, res) => {
-  const { localPath, editPlan, musicVolume = 0.8, originalVolume = 0.9, generationTier = 'ORIGINAL FOOTAGE ONLY', rifeMultiplier, artifacts } = req.body || {};
+  const { localPath, editPlan, musicVolume = 0.8, originalVolume = 0.9, generationTier = 'ORIGINAL FOOTAGE ONLY', rifeMultiplier, artifacts, storyteller } = req.body || {};
   if (!localPath || !fs.existsSync(localPath)) {
     return res.status(400).json({ success: false, error: 'Valid uploaded video localPath is required.' });
   }
@@ -1143,7 +1228,7 @@ app.post('/api/render-full-cinematic', async (req, res) => {
     ? { trackingPath: artifacts.trackingPath, eventsPath: artifacts.eventsPath }
     : undefined;
   // Fire-and-forget: the heavy work continues after this response is sent.
-  void runFullRenderJob(jobId, { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier: multiplier, precomputedArtifacts });
+  void runFullRenderJob(jobId, { localPath, editPlan, musicVolume, originalVolume, generationTier, rifeMultiplier: multiplier, precomputedArtifacts, storyteller });
 
   return res.status(202).json({
     success: true,
@@ -1844,6 +1929,56 @@ app.post('/api/cinematic-director/plan', async (req, res) => {
     return res.json({ success: result.applied, ...result });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err?.message || 'Cinematic Director failed.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PSYCHOLOGICAL STORYTELLER — status + orchestration.
+// The status probe is read-only (no model load, no network). The orchestrate
+// route runs the OPTIONAL layer against a supplied plan + real evidence and
+// returns the ADDITIVELY-enriched plan plus the story bundle. Both are safe to
+// poll and never throw (they always return JSON).
+// ---------------------------------------------------------------------------
+app.get('/api/psychology/status', (req, res) => {
+  res.json({ success: true, ...storytellerService.status() });
+});
+
+app.post('/api/psychology/orchestrate', async (req, res) => {
+  try {
+    const { localPath, editPlan, duration, artifacts = {} } = req.body || {};
+    if (!editPlan || !Array.isArray(editPlan.timeline)) {
+      return res.status(400).json({ success: false, error: 'An editPlan with a timeline is required.' });
+    }
+    let dur = Number(duration) || Number(editPlan.duration) || 64;
+    if (localPath && fs.existsSync(String(localPath))) {
+      try {
+        const probe = await execPromise(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${JSON.stringify(localPath)}`);
+        dur = Number.parseFloat(probe.stdout.trim()) || dur;
+      } catch { /* keep dur */ }
+    }
+    const resolved = storytellerService.resolveArtifacts(editPlan, {
+      trackingPath: typeof artifacts.trackingPath === 'string' ? artifacts.trackingPath : undefined,
+      eventsPath: typeof artifacts.eventsPath === 'string' ? artifacts.eventsPath : undefined,
+      directorPath: typeof artifacts.directorPath === 'string' ? artifacts.directorPath : undefined,
+      motionPath: typeof artifacts.motionPath === 'string' ? artifacts.motionPath : undefined,
+    });
+    const started = Date.now();
+    const result = await storytellerService.enrich(
+      typeof localPath === 'string' && fs.existsSync(localPath) ? localPath : '',
+      dur, editPlan, resolved);
+    return res.json({
+      success: true,
+      applied: result.applied,
+      message: result.message || null,
+      durationMs: Date.now() - started,
+      metrics: result.metrics || null,
+      duel: result.bundle?.duel || null,
+      story_arc: result.bundle?.story_arc || [],
+      story_script: Array.isArray(editPlan?.story_script) ? editPlan.story_script : [],
+      editPlan,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Psychological orchestration failed.' });
   }
 });
 
