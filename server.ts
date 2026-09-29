@@ -14,6 +14,17 @@ import { cinematicEngine } from './server/cinematicEngine';
 import { samService } from './server/samService';
 import { referenceStyleService, CinematicMode } from './server/referenceStyleService';
 import { storytellerService } from './server/storytellerService';
+import {
+  openRouterText,
+  openRouterVision,
+  deepseekText,
+  providerHealth,
+  providerConfigured,
+  sanitize,
+  OPENROUTER_TEXT_MODEL,
+  OPENROUTER_VISION_MODEL,
+  DEEPSEEK_MODEL,
+} from './server/aiProviders';
 
 const execPromise = util.promisify(exec);
 
@@ -28,7 +39,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
-const BUILD_VERSION = '2026-09-27-exceptional-v10.1.0-local-motion';
+const BUILD_VERSION = '2026-09-27-exceptional-v10.2.0-openrouter-deepseek';
 
 // Enable CORS for frontend requests
 app.use(cors({
@@ -62,9 +73,14 @@ app.get('/api/version', (req, res) => {
     success: true,
     service: 'fotbal-backend',
     buildVersion: BUILD_VERSION,
-    pipeline: 'football-director-v10 + LOCAL-motion-analysis (no external video API) + evidence-engine + YOLO-ByteTrack + ReID + event-engine + optional-SAM-segmentation + beat-sync + scene-aware-RIFE + ffmpeg',
+    pipeline: 'football-director-v10 + LOCAL-motion-analysis + Optional-OpenRouter(VLM/text) + Optional-DeepSeek + evidence-engine + YOLO-ByteTrack + ReID + event-engine + optional-SAM-segmentation + beat-sync + scene-aware-RIFE + ffmpeg',
     videoAnalysis: 'local-opencv-motion',
     externalVideoApi: false,
+    // OPTIONAL providers: capability flags only — never the keys themselves.
+    optionalAiProviders: {
+      openrouter: providerConfigured('openrouter'),
+      deepseek: providerConfigured('deepseek'),
+    },
     // OPTIONAL SAM layer: reported as a capability flag only — the heavy engine
     // lives in its own isolated interpreter and is OFF unless SAM_ENABLED=true.
     sam: { enabled: samService.enabled, adapter: process.env.SAM_ADAPTER || 'auto', isolated: Boolean(process.env.SAM_PYTHON_BIN) },
@@ -162,6 +178,228 @@ async function runLocalMotionAnalysis(videoPath: string): Promise<LocalMotionAna
   }
   return parsed as LocalMotionAnalysis;
 }
+
+// ---------------------------------------------------------------------------
+// OPTIONAL AI PROVIDER INTEGRATION (OpenRouter VLM + DeepSeek text)
+//
+// These helpers are the REAL wiring into the render path the project actually
+// uses:
+//   * `enhancePlanWithOptionalProviders` is called by POST /api/analyze-video and
+//     sends REAL JPEG frames extracted from the uploaded footage (as base64 data
+//     URLs) to the OpenRouter VLM, so the model sees ACTUAL pixels — never just a
+//     text prompt.
+//   * `generateCommentaryScript` lets OpenRouter / DeepSeek write the Arabic
+//     commentary from the VERIFIED timeline, with the local narration as fallback.
+//   * `applyProviderEnvironment` maps OPENROUTER_API_KEY onto the pre-existing
+//     generic VLM layer (yolo/vlm_analyzer.py) so the psychological "Predator vs
+//     Prey" layer also uses REAL sampled frames.
+//
+// Every call is OPTIONAL and FAIL-SAFE: a missing key or a failed request returns
+// `null` / the local script and the render continues unchanged. Each call is
+// recorded (secret-free) for GET /api/ai/status so success is PROVABLE.
+// ---------------------------------------------------------------------------
+
+/** Frame scale for the VLM. Small = fast + cheap, still legible. */
+const VLM_FRAME_WIDTH = Number(process.env.VLM_FRAME_WIDTH || 480);
+
+/**
+ * Map the OPTIONAL provider keys onto the EXISTING optional layers WITHOUT adding
+ * new secrets or new providers. Only DEFAULTS are filled in: an explicitly set
+ * VLM_* variable always wins, so existing deployments are unaffected.
+ *
+ *   OPENROUTER_API_KEY -> the OpenAI-compatible VLM layer consumed by
+ *        yolo/vlm_analyzer.py (VLM_PROVIDER=openai, VLM_BASE_URL=OpenRouter).
+ *   DEEPSEEK_API_KEY   -> read directly by yolo/deepseek_storyteller.py.
+ *
+ * No key is ever logged.
+ */
+function applyProviderEnvironment(): void {
+  const orKey = (process.env.OPENROUTER_API_KEY || '').trim();
+  if (orKey && !process.env.VLM_API_KEY) {
+    process.env.VLM_API_KEY = orKey;
+    if (!process.env.VLM_PROVIDER) process.env.VLM_PROVIDER = 'openai';
+    if (!process.env.VLM_BASE_URL) {
+      process.env.VLM_BASE_URL = (process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
+    }
+    if (!process.env.VLM_MODEL) {
+      process.env.VLM_MODEL = process.env.OPENROUTER_VISION_MODEL || OPENROUTER_VISION_MODEL;
+    }
+  }
+}
+
+/**
+ * Extract real JPEG frames from the uploaded footage at the given source
+ * timestamps and return them as `data:image/jpeg;base64,...` URLs so the ACTUAL
+ * pixels (not a metadata description) reach the vision model.
+ */
+async function extractFrameDataUrls(videoPath: string, timestamps: number[], maxFrames = 8): Promise<string[]> {
+  const urls: string[] = [];
+  const tmpDir = path.join('/tmp/football_engine/work', `vlm_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+  try {
+    const unique = Array.from(new Set(timestamps.map((t) => Math.max(0, Number(t) || 0)))).slice(0, maxFrames);
+    for (let i = 0; i < unique.length; i++) {
+      const out = path.join(tmpDir, `f_${i}.jpg`);
+      try {
+        await execPromise(`ffmpeg -y -ss ${unique[i].toFixed(3)} -i ${JSON.stringify(videoPath)} -frames:v 1 -vf "scale=${VLM_FRAME_WIDTH}:-2" -q:v 4 ${JSON.stringify(out)}`);
+        if (fs.existsSync(out) && fs.statSync(out).size > 500) {
+          urls.push(`data:image/jpeg;base64,${fs.readFileSync(out).toString('base64')}`);
+        }
+      } catch { /* skip this frame, keep the rest */ }
+    }
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+  return urls;
+}
+
+interface AiPlanTelemetry {
+  openrouterVision: string;
+  openrouterText: string;
+  deepseek: string;
+  usedVision: boolean;
+  usedDeepseek: boolean;
+}
+
+function telemetryLine(r: { status: string; model: string; httpStatus: number; latencyMs: number; error?: string }): string {
+  return `${r.status} (model=${r.model}, http=${r.httpStatus || 'n/a'}, ${r.latencyMs}ms${r.error ? `, ${r.error}` : ''})`;
+}
+
+/** Validate + normalise an AI-provider plan into the editor's timeline shape. */
+function parseAiPlan(content: any): any | null {
+  try {
+    const parsed = JSON.parse(String(content || '').replace(/^```(?:json)?/i, '').replace(/```$/, '').trim());
+    if (Array.isArray(parsed?.timeline) && parsed.timeline.length >= 4) return parsed;
+  } catch { /* not usable */ }
+  return null;
+}
+
+/**
+ * Ask the optional providers for an ENHANCED edit plan (real vision first).
+ *   1. OpenRouter VLM looks at REAL extracted frames (primary — true vision).
+ *   2. If the VLM is unavailable/failed, DeepSeek refines from the local motion.
+ *   3. Any failure returns null and the caller keeps the pure-local plan.
+ */
+async function enhancePlanWithOptionalProviders(
+  videoPath: string,
+  videoDuration: number,
+  localPlan: any,
+  motion: LocalMotionAnalysis,
+  styleName: string
+): Promise<{ plan: any | null; telemetry: AiPlanTelemetry }> {
+  const telemetry: AiPlanTelemetry = {
+    openrouterVision: 'not_attempted',
+    openrouterText: 'not_attempted',
+    deepseek: 'not_attempted',
+    usedVision: false,
+    usedDeepseek: false,
+  };
+
+  const motionDigest = {
+    duration: Number(motion.duration || videoDuration),
+    mean_energy: motion.mean_energy,
+    thresholds: motion.thresholds,
+    action_moments: (motion.action_moments || []).slice(0, 12),
+    slow_moments: (motion.slow_moments || []).slice(0, 12),
+    peaks: (motion.peaks || []).slice(0, 12),
+  };
+  const requiredShape = `{"timeline":[{"source_start":number,"source_end":number,"action":string,"importance":1-10,"speed":0.5-2,"zoom_start":number,"zoom_end":number,"crop_x":0-1,"crop_y":0-1,"transition":"hard_cut"|"directional_blur"|"flash","text":string,"shot_type":"wide"|"medium"|"close_up"|"extreme_close_up"|"action"|"reaction"|"crowd"|"detail","beat_role":"hook"|"setup"|"escalation"|"impact"|"reaction"|"climax"|"outro"}]}`;
+  const system = `You are an elite football short-form editor. You MUST ground every source_start/source_end strictly inside the real footage (0..${Number(motion.duration || videoDuration).toFixed(2)}s). Never invent a goal, score, player name or event that is not clearly visible. Return STRICT JSON only.`;
+
+  // ---- 1) OpenRouter VLM on REAL frames ----
+  const candidateTimes = [
+    ...(localPlan?.timeline || []).map((c: any) => Number(c.source_start)),
+    ...(motion.peaks || []).map((p: any) => Number(p.t)),
+  ].filter((t: number) => Number.isFinite(t));
+  let frames: string[] = [];
+  try {
+    frames = await extractFrameDataUrls(videoPath, candidateTimes, Number(process.env.VLM_MAX_FRAMES || 8));
+  } catch { frames = []; }
+
+  if (providerConfigured('openrouter') && frames.length) {
+    const user = `You are shown ${frames.length} real frames sampled from a football video (in chronological order by source time).\nLocal motion evidence: ${JSON.stringify(motionDigest)}.\nDesign a premium 64-second 9:16 vertical montage in the style "${styleName}" using 14-22 shots.\nUse ONLY source times within 0..${Number(motion.duration || videoDuration).toFixed(2)}s.\nReturn JSON exactly: ${requiredShape}`;
+    const r = await openRouterVision(frames, user, { system, model: OPENROUTER_VISION_MODEL, json: true, maxTokens: 2000 });
+    providerHealth.record('openrouter', 'vision', r);
+    telemetry.openrouterVision = telemetryLine(r);
+    if (r.status === 'executed') {
+      const parsed = parseAiPlan(r.data?.content);
+      if (parsed) { telemetry.usedVision = true; return { plan: parsed, telemetry }; }
+      telemetry.openrouterVision += ' | JSON had too few shots';
+    }
+  } else if (!providerConfigured('openrouter')) {
+    telemetry.openrouterVision = 'not_configured (no OPENROUTER_API_KEY)';
+  } else {
+    telemetry.openrouterVision = 'failed (no frames could be extracted)';
+  }
+
+  // ---- 2) DeepSeek refines from the local motion evidence ----
+  if (providerConfigured('deepseek')) {
+    const user = `Refine this football montage plan. Write short editorial action labels and captions; do NOT invent events.\nLocal motion evidence: ${JSON.stringify(motionDigest)}\nCurrent plan: ${JSON.stringify({ timeline: (localPlan?.timeline || []).slice(0, 22) })}\nReturn JSON exactly: ${requiredShape}`;
+    const r = await deepseekText(user, { system, model: DEEPSEEK_MODEL, json: true, maxTokens: 2000 });
+    providerHealth.record('deepseek', 'text', r);
+    telemetry.deepseek = telemetryLine(r);
+    if (r.status === 'executed') {
+      const parsed = parseAiPlan(r.data?.content);
+      if (parsed) { telemetry.usedDeepseek = true; return { plan: parsed, telemetry }; }
+      telemetry.deepseek += ' | JSON had too few shots';
+    }
+  } else {
+    telemetry.deepseek = 'not_configured (no DEEPSEEK_API_KEY)';
+  }
+
+  return { plan: null, telemetry };
+}
+
+/**
+ * Merge an optional AI-provider plan into the local plan: keep the local plan's
+ * VERIFIED structure/timing as the backbone and adopt the provider's editorial
+ * text/shot-type/zoom only where present. This guarantees an AI can NEVER move a
+ * source timestamp outside the real footage.
+ */
+function mergeAiPlanIntoLocal(localPlan: any, aiPlan: any): any {
+  const localTl = Array.isArray(localPlan?.timeline) ? localPlan.timeline : [];
+  const aiTl = Array.isArray(aiPlan?.timeline) ? aiPlan.timeline : [];
+  if (!localTl.length || !aiTl.length) return localPlan;
+  const merged = localTl.map((c: any, i: number) => {
+    const a = aiTl[Math.min(i, aiTl.length - 1)] || {};
+    const text = typeof a.text === 'string' && a.text.trim() ? a.text : c.text;
+    const action = typeof a.action === 'string' && a.action.trim() ? a.action.trim().slice(0, 160) : c.action;
+    const shot = ['wide', 'medium', 'close_up', 'extreme_close_up', 'eye_close_up', 'action', 'reaction', 'crowd', 'detail'].includes(String(a.shot_type)) ? String(a.shot_type) : c.shot_type;
+    const trans = ['hard_cut', 'directional_blur', 'flash'].includes(String(a.transition)) ? String(a.transition) : c.transition;
+    return {
+      ...c,
+      text,
+      action,
+      shot_type: shot,
+      transition: trans,
+      narration: typeof a.narration === 'string' && a.narration.trim() ? a.narration.trim().slice(0, 90) : c.narration,
+      zoom_start: Number.isFinite(Number(a.zoom_start)) ? Math.max(1, Math.min(1.55, Number(a.zoom_start))) : c.zoom_start,
+      zoom_end: Number.isFinite(Number(a.zoom_end)) ? Math.max(1, Math.min(1.65, Number(a.zoom_end))) : c.zoom_end,
+    };
+  });
+  return { ...localPlan, timeline: merged };
+}
+
+// Expose provider health + real-call proof (never returns keys).
+app.get('/api/ai/status', (req, res) => {
+  res.json({
+    success: true,
+    providers: {
+      openrouter: { configured: providerConfigured('openrouter'), textModel: OPENROUTER_TEXT_MODEL, visionModel: OPENROUTER_VISION_MODEL },
+      deepseek: { configured: providerConfigured('deepseek'), model: DEEPSEEK_MODEL },
+    },
+    // The same keys the subprocess VLM/DeepSeek layers would use (derived, never
+    // the key value): proves the OpenRouter -> VLM mapping is active.
+    vlmLayer: {
+      enabled: Boolean(process.env.VLM_API_KEY),
+      provider: process.env.VLM_PROVIDER || null,
+      model: process.env.VLM_MODEL || null,
+      base: process.env.VLM_BASE_URL || null,
+    },
+    lastCalls: providerHealth.snapshot(),
+  });
+});
+
 
 /**
  * Build a real, source-grounded 64-second edit plan ENTIRELY from local motion.
@@ -1422,9 +1660,12 @@ function runYoloTracking(
  * them to delivery parameters (emotion/intensity/pause) from the shot's beat
  * role. Nothing about a goal, player, score or event is ever invented.
  */
-async function generateCommentaryScript(plan: any, _style: string): Promise<any[]> {
+async function generateCommentaryScript(plan: any, style: string): Promise<any[]> {
   const timeline = Array.isArray(plan?.timeline) ? plan.timeline : [];
-  return timeline
+
+  // LOCAL fallback: build the script from the per-shot editorial `narration`
+  // lines already produced by the editor. Nothing is invented.
+  const localLines = timeline
     .filter((t: any) => t && String(t.narration || '').trim())
     .map((t: any, i: number) => ({
       timeline_index: Number(t.timeline_index ?? i),
@@ -1434,6 +1675,64 @@ async function generateCommentaryScript(plan: any, _style: string): Promise<any[
       pause_after_ms: t.beat_role === 'climax' ? 320 : 220,
     }))
     .slice(0, 14);
+
+  // OPTIONAL: let OpenRouter (preferred) or DeepSeek WRITE natural Arabic
+  // commentary from the VERIFIED timeline. The prompt forbids inventing events.
+  if (!providerConfigured('openrouter') && !providerConfigured('deepseek')) {
+    return localLines;
+  }
+  const verified = timeline.map((t: any) => ({
+    timeline_index: t.timeline_index,
+    source: [t.source_start, t.source_end],
+    output: [t.output_start, t.output_end],
+    action: String(t.action || '').slice(0, 90),
+    beat_role: t.beat_role,
+  }));
+  const user = `اكتب تعليقًا صوتيًا عربيًا طبيعيًا (كمعلّق محترف) لمقطع كرة قدم سينمائي مدته 64 ثانية.
+لا تخترع هدفًا أو تمريرة أو اسم لاعب أو نتيجة أو بطولة؛ استخدم فقط ما يثبته action في كل لقطة.
+جمل قصيرة متفاوتة الطول، انفعالات تتصاعد نحو climax، واترك بعض اللقطات بلا كلام.
+الأسلوب: ${style}
+الخط الزمني الموثق: ${JSON.stringify(verified)}
+أخرج JSON فقط بالشكل: [{"timeline_index":number,"text":string,"emotion":"calm|focused|excited|intense|shock|triumphant|emotional","intensity":0.0,"pause_after_ms":number}]
+الحد الأقصى 14 سطرًا، وكل سطر من 3 إلى 16 كلمة.`;
+  const system = `You are a professional Arabic football commentator. Return STRICT JSON only. Never invent a goal, score, player, or event that the timeline does not prove.`;
+
+  const tryParse = (content: any): any[] | null => {
+    try {
+      const parsed = JSON.parse(String(content || '').replace(/^```(?:json)?/i, '').replace(/```$/, '').trim());
+      if (Array.isArray(parsed) && parsed.length) {
+        return parsed
+          .filter((l: any) => l && String(l.text || '').trim())
+          .map((l: any, i: number) => ({
+            timeline_index: Number(l.timeline_index ?? i),
+            text: String(l.text).trim().slice(0, 120),
+            emotion: String(l.emotion || 'focused'),
+            intensity: Math.max(0, Math.min(1, Number(l.intensity) || 0.55)),
+            pause_after_ms: Math.max(0, Math.min(1200, Number(l.pause_after_ms) || 220)),
+          }))
+          .slice(0, 14);
+      }
+    } catch { /* fall through */ }
+    return null;
+  };
+
+  if (providerConfigured('openrouter')) {
+    const r = await openRouterText(user, { system, model: OPENROUTER_TEXT_MODEL, json: true, maxTokens: 1200 });
+    providerHealth.record('openrouter', 'text', r);
+    if (r.status === 'executed') {
+      const parsed = tryParse(r.data?.content);
+      if (parsed && parsed.length) return parsed;
+    }
+  }
+  if (providerConfigured('deepseek')) {
+    const r = await deepseekText(user, { system, model: DEEPSEEK_MODEL, json: true, maxTokens: 1200 });
+    providerHealth.record('deepseek', 'text', r);
+    if (r.status === 'executed') {
+      const parsed = tryParse(r.data?.content);
+      if (parsed && parsed.length) return parsed;
+    }
+  }
+  return localLines;
 }
 
 
@@ -1442,8 +1741,11 @@ async function probeAudioDuration(filePath: string): Promise<number> {
   return Math.max(0, Number.parseFloat(p.stdout.trim()) || 0);
 }
 
-async function buildTimedCommentary(plan: any, style: string): Promise<{ audioPath: string; script: any[] }> {
+async function buildTimedCommentary(plan: any, style: string, dryRun = false): Promise<{ audioPath: string; script: any[] }> {
   const script = await generateCommentaryScript(plan, style);
+  // dryRun: return the (optionally AI-generated) script WITHOUT synthesising
+  // audio — lets ops verify the commentary TEXT provider with no TTS configured.
+  if (dryRun) return { audioPath: '', script };
   const timeline = Array.isArray(plan?.timeline) ? plan.timeline : [];
   const work = path.join('/tmp/football_engine/work', `commentary_${Date.now()}`);
   fs.mkdirSync(work, { recursive: true });
@@ -1661,7 +1963,7 @@ app.post('/api/analyze-video', async (req, res) => {
       subject: videoMetadata?.defaultSubject,
     });
 
-    const parsed = director.applied && director.plan
+    let parsed = director.applied && director.plan
       ? director.plan
       : buildLocalEditPlan(duration, motion, style);
     parsed.generationTier = generationTier;
@@ -1672,6 +1974,17 @@ app.post('/api/analyze-video', async (req, res) => {
     } else {
       (parsed as any).cinematicDirectorSource = 'local-motion-fallback';
       (parsed as any).cinematicDirectorMessage = director.message || 'director unavailable';
+    }
+
+    // 3b) OPTIONAL enrichment: OpenRouter VLM (REAL extracted frames) primary,
+    //     DeepSeek (local motion evidence) secondary. When no key is configured,
+    //     or the call fails, this returns null and the local/director plan is
+    //     kept as-is — the render NEVER stops.
+    currentRenderProgress = { percent: 18, stage: 'Optional AI enrichment (OpenRouter VLM / DeepSeek)...' };
+    const enhancement = await enhancePlanWithOptionalProviders(localPath, duration, parsed, motion, style);
+    const usedEnhancedPlan = Boolean(enhancement.plan);
+    if (enhancement.plan) {
+      parsed = mergeAiPlanIntoLocal(parsed, enhancement.plan);
     }
 
     currentRenderProgress = { percent: 22, stage: 'Validating the 64-second edit plan...' };
@@ -1699,8 +2012,17 @@ app.post('/api/analyze-video', async (req, res) => {
       editPlan: validatedPlan,
       fallbackUsed: false,
       videoAnalyzed: true,
-      analysisMode: director.applied ? 'cinematic-director-v11' : 'local-motion',
+      analysisMode: usedEnhancedPlan
+        ? (director.applied ? 'cinematic-director-v11 + optional-ai' : 'local-motion + optional-ai')
+        : (director.applied ? 'cinematic-director-v11' : 'local-motion'),
       model: motion.model || 'local-opencv-motion',
+      // Secret-free provider telemetry: executed/failed/not_configured + http + ms.
+      aiProviders: {
+        openrouterVision: enhancement.telemetry.openrouterVision,
+        openrouterText: enhancement.telemetry.openrouterText,
+        deepseek: enhancement.telemetry.deepseek,
+        enhancedPlanUsed: usedEnhancedPlan,
+      },
       cinematicMode: resolvedMode,
       cinematicDirector: {
         applied: director.applied,
@@ -1733,14 +2055,17 @@ app.post('/api/analyze-video', async (req, res) => {
 // 8.5. POST /api/commentary/generate
 app.post('/api/commentary/generate', async (req, res) => {
   try {
-    const { editPlan, style = 'CINEMATIC SPORTS', videoLocalPath } = req.body;
-    const generated = await buildTimedCommentary(editPlan, style);
+    const { editPlan, style = 'CINEMATIC SPORTS', videoLocalPath, dryRun = false } = req.body;
+    const generated = await buildTimedCommentary(editPlan, style, Boolean(dryRun));
     const script = generated.script;
     const audioPath = generated.audioPath;
-    const finalVideoPath = videoLocalPath && fs.existsSync(videoLocalPath) ? await muxCommentary(videoLocalPath, audioPath) : undefined;
+    if (dryRun) {
+      return res.json({ success: true, dryRun: true, script, provider: 'text-only' });
+    }
+    const finalVideoPath = videoLocalPath && fs.existsSync(videoLocalPath) && audioPath ? await muxCommentary(videoLocalPath, audioPath) : undefined;
     res.json({
-      success: true, provider: 'ElevenLabs', script, commentaryAudioUrl: `/videos/${path.basename(audioPath)}`,
-      audioUrl: `/videos/${path.basename(audioPath)}`,
+      success: true, provider: 'ElevenLabs', script, commentaryAudioUrl: audioPath ? `/videos/${path.basename(audioPath)}` : undefined,
+      audioUrl: audioPath ? `/videos/${path.basename(audioPath)}` : undefined,
       finalVideoUrl: finalVideoPath ? `/videos/${path.basename(finalVideoPath)}` : undefined,
       voiceId: process.env.ELEVENLABS_VOICE_ID || '',
     });
@@ -2031,7 +2356,16 @@ async function verifyFFmpegBinaries(): Promise<boolean> {
 
 // Serve frontend in development via Vite middleware or production build
 async function startServer() {
+  // Map the OPTIONAL provider keys onto the pre-existing optional layers BEFORE
+  // anything spawns a subprocess, then report CONFIGURATION only (never keys).
+  applyProviderEnvironment();
+
   await verifyFFmpegBinaries();
+
+  console.log(`[BOOT] Optional AI providers -> OpenRouter: ${providerConfigured('openrouter') ? 'configured' : 'not configured'} | DeepSeek: ${providerConfigured('deepseek') ? 'configured' : 'not configured'}`);
+  if (process.env.VLM_API_KEY) {
+    console.log(`[BOOT] Optional VLM layer -> provider=${process.env.VLM_PROVIDER || 'qwen2-vl'} model=${process.env.VLM_MODEL || 'n/a'} base=${process.env.VLM_BASE_URL || 'default'}`);
+  }
 
   // Storage diagnostics: makes the persistence mode obvious in Render logs.
   console.log(`[BOOT] Storage driver: ${storage.driver} | media dir: ${storage.mediaDir}`);

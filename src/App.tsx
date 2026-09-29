@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { AiProviderBadge } from './components/AiProviderBadge';
 import {
   Zap,
   Film,
@@ -485,6 +486,7 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            <AiProviderBadge />
             <KeyStatusBadge />
             {isMasterRendered && (
               <span className="px-2.5 py-1 rounded-xl bg-red-600/90 text-white font-bold text-xs flex items-center gap-1 shadow animate-pulse">
